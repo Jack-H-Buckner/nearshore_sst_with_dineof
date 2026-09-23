@@ -1,0 +1,8 @@
+# common data types
+*.zarr
+*.csv
+*.nc
+*.
+
+# plots
+*.png
