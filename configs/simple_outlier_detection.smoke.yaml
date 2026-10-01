@@ -1,0 +1,91 @@
+# Run the single-pass outlier detector over the DINEOF filtering smoke-test dates.
+#
+#   python prototypes/cloud_mixture_model/src/simple_outlier_detection.py \
+#       --config prototypes/DINEOF/configs/simple_outlier_detection.smoke.yaml
+#
+# A copy of configs/simple_outlier_detection.eco.yaml with only `data.dates` and `output.*`
+# changed, so whatever this run shows is attributable to the scene choice and not to retuned
+# parameters. Outputs land in the DINEOF tree so the two prototypes do not mix.
+#
+# WHY THIS RUNS WHERE outlier_detection.smoke.yaml COULD NOT: that config inherited
+# `reference.window_days: 1`, and modis_sst_aqua covers a median of only 7% of the AoI water
+# on the 123 of 365 days it exists at all. Every one of the six March dates came back
+# "0.0% of water pixels had reference data" -- a detector with no covariate fits a flat prior
+# and its verdicts mean nothing. At window_days: 4 the composite clears the min_cover gate on
+# all six (0.17 to 0.27 of AoI water), so the smoke dates are finally usable.
+#
+# Relative paths resolve against prototypes/cloud_mixture_model (the SCRIPT's root, not this
+# file's); the output paths are absolute so they land in DINEOF regardless.
+
+data:
+  cube: data/datacube/admiralty_inlet.zarr
+  var: eco_sst_v002
+  validvar: eco_valid_v002
+  cloudvar: eco_cloud_v002
+  ref_var: modis_sst_aqua
+  landvar: landcover_water
+  depthvar: depth_cudem
+  tidal_depth_m: 3.0
+  # Two groups, deliberately:
+  #
+  #   2025-03-01/04/05/07/09/11 -- THE SMOKE TEST. What `filter_images.py --limit 6` draws.
+  #     Filter verdicts: 03-01, 03-05, 03-07 PASS; 03-04, 03-09, 03-11 FAIL.
+  #
+  #   2025-04-18/23, 06-15, 08-08, 10-02, 05-25 -- the dates the FULL outlier_detection.py
+  #     ran on, carried over so the single-pass and looped detectors can be compared on
+  #     identical scenes. 05-25 is the one the filter already rejects (the control).
+  dates: ["2025-03-01", "2025-03-04", "2025-03-05", "2025-03-07", "2025-03-09", "2025-03-11",
+          "2025-04-18", "2025-04-23", "2025-06-15", "2025-08-08", "2025-10-02", "2025-05-25"]
+  min_pixels: 64
+
+output:
+  dir: /Users/johnbuckner/github/coastal_sst_data/prototypes/DINEOF/outputs/simple_outlier_check
+  fig_dir: /Users/johnbuckner/github/coastal_sst_data/prototypes/DINEOF/figures/simple_outlier_check/admiralty_inlet
+  write_netcdf: true
+  write_figures: true
+
+reference:
+  window_days: 4
+  qc_var: null
+  qc_max: 1
+  quantile: 0.5
+  min_obs: 1
+  min_cover: 0.05
+
+covariate:
+  init_prior: 285.0
+  init_range_px: 200.0
+  init_marg_sd: 0.05
+  init_obs_error: 0.5
+  alpha: 2
+
+clear:
+  sd: 0.75
+  sd_floor: 0.71
+
+qc:
+  enabled: true
+  prior_cloud: 0.9
+  nodata_prior: 0.5
+
+offset:
+  lower: -2.0
+  upper: 2.0
+
+mixture:
+  lambda_cloud: 4.0
+  prior_cloud: 0.5
+  lambda_hot: 6.5
+  prior_hot: 0.005
+  p_h_tidal: 0.5
+  beta_cloud: 1.75
+  n_sweeps_cloud: 20
+  beta_hot: 0.125
+  n_sweeps_hot: 10
+  estep_damp: 0.5
+  p_floor: 0.01
+
+solver:
+  tol: 1.0e-2
+  pcg_max_iter: 25
+  precondition: true

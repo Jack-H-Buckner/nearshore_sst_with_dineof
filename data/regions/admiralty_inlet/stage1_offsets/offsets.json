@@ -1,0 +1,128 @@
+{
+  "aoi": "admiralty_inlet",
+  "config": "configs/region.admiralty_inlet.yaml",
+  "config_sha": "42972965aa9c",
+  "masks": "sensor QC only",
+  "time_range": [
+    "2025-03-01",
+    "2026-02-28"
+  ],
+  "mode": "auto",
+  "recommend_rule": "rma if its LOSO RMSE <= (1 - 0.02) x fixed's",
+  "sensors": {
+    "eco": {
+      "label": "ECOSTRESS v002",
+      "recommended": "fixed",
+      "chosen": "fixed",
+      "models": {
+        "fixed": {
+          "a": 1.1339586982457464,
+          "b": 1.0,
+          "x0": 0.0,
+          "off": 1.1339586982457464,
+          "slope": 1.0,
+          "n_scenes": 35,
+          "valid": true,
+          "loso_rmse": 1.0523401479441918,
+          "loso_rmse_scene": 2.002286585427261,
+          "loso_bias": -0.1460648438752502,
+          "loso_scenes": 47
+        },
+        "rma": {
+          "a": 1.0227965368821272,
+          "b": 1.488754552105268,
+          "x0": 282.2825012207031,
+          "off": -136.9440609143974,
+          "slope": 1.488754552105268,
+          "n_scenes": 35,
+          "valid": true,
+          "loso_rmse": 1.384560367653424,
+          "loso_rmse_scene": 2.295349066119457,
+          "loso_bias": -0.23353862064226527,
+          "loso_scenes": 47
+        }
+      },
+      "diagnostics": {
+        "rma_ci": [
+          1.0720751889902567,
+          2.0965546960141164
+        ],
+        "ols_across": 0.8981684069646974,
+        "ols_ci": [
+          0.6798372630109393,
+          1.1237884097330968
+        ],
+        "modis_range": 8.274993896484375,
+        "n_scene_medians": 47,
+        "clip": {
+          "n_pairs": 2503,
+          "n_removed": 644,
+          "rounds": 10,
+          "converged": true,
+          "scale": 0.25977624206542965
+        },
+        "within_r": 0.8524652738675332,
+        "within_rma": 0.9685294780145719,
+        "within_ols": 0.8256377467244697,
+        "within_modis_sd": 0.18975328528989766
+      }
+    },
+    "lst": {
+      "label": "Landsat",
+      "recommended": "rma",
+      "chosen": "rma",
+      "models": {
+        "fixed": {
+          "a": 0.49129299988271596,
+          "b": 1.0,
+          "x0": 0.0,
+          "off": 0.49129299988271596,
+          "slope": 1.0,
+          "n_scenes": 11,
+          "valid": true,
+          "loso_rmse": 0.908973054299577,
+          "loso_rmse_scene": 0.8395060747637091,
+          "loso_bias": 0.03156994890474133,
+          "loso_scenes": 12
+        },
+        "rma": {
+          "a": 0.3899903737085329,
+          "b": 1.3436523099370132,
+          "x0": 282.1649932861328,
+          "off": -96.57666135243284,
+          "slope": 1.3436523099370132,
+          "n_scenes": 11,
+          "valid": true,
+          "loso_rmse": 0.7955952300849356,
+          "loso_rmse_scene": 0.728941411310618,
+          "loso_bias": -0.047297570742254415,
+          "loso_scenes": 12
+        }
+      },
+      "diagnostics": {
+        "rma_ci": [
+          1.2158330677850342,
+          1.5340225868041515
+        ],
+        "ols_across": 1.283251450315283,
+        "ols_ci": [
+          1.1314983436180366,
+          1.452501017863194
+        ],
+        "modis_range": 4.802490234375,
+        "n_scene_medians": 12,
+        "clip": {
+          "n_pairs": 717,
+          "n_removed": 199,
+          "rounds": 7,
+          "converged": true,
+          "scale": 0.3049311126708984
+        },
+        "within_r": 0.8945409381910707,
+        "within_rma": 1.1173951694383573,
+        "within_ols": 0.9995557231995587,
+        "within_modis_sd": 0.16094544142022638
+      }
+    }
+  }
+}

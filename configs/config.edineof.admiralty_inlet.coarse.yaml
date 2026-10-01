@@ -1,0 +1,216 @@
+# 400 m TUNING variant of config.edineof.admiralty_inlet.yaml.
+#
+# Identical except: matrix.coarsen = 4 and filter.alpha = 0.025. Block-averaging to 400 m cuts
+# the matrix from 55,561 to 3,687 pixels and measured 5.9x faster per EM iteration, which makes
+# the k/p search practical to iterate on. The reconstruction it produces is a TUNING artifact,
+# not a product -- the inverse transform is approximate at coarsen > 1 (see matrix.coarsen).
+# Find k and p here, then run the full-resolution config with them.
+#
+#   python prototypes/DINEOF/src/edineof.py \
+#       --config prototypes/DINEOF/configs/config.edineof.admiralty_inlet.coarse.yaml \
+#       --k 10 --p 3 --tag p3
+#
+# --tag suffixes the cube, figure dir and CSVs, so variant runs sit side by side.
+
+# eDINEOF: reconstruct a gap-free daily SST field from the standardized cube.
+#
+#   python prototypes/DINEOF/src/edineof.py \
+#       --config prototypes/DINEOF/configs/config.edineof.admiralty_inlet.yaml
+#   ... --dry-run        # build the matrix, report its shape and the CV split, stop
+#   ... --k 12 --p 8     # skip the searches, run one combination
+#
+# Every key outside `carry` is validated two levels deep; an unknown key is an error, not a
+# silent default. Relative paths resolve against prototypes/DINEOF.
+
+data:
+  aoi: admiralty_inlet
+  cube: data/datacube/admiralty_inlet_standardized.zarr    # source, read-only
+  out: data/datacube/admiralty_inlet_dineof.zarr           # destination
+  watervar: landcover_water
+  channel: sst_z                    # the standardized anomaly
+  coef: sst_seasonal_coef           # used to invert the standardization at the end
+  scale: sst_seasonal_sd
+
+# ------------------------------------------------------------------ matrix
+matrix:
+  # Minimum observations for a PIXEL to enter the matrix. Must be >= 1, and the reason is
+  # structural rather than statistical: a pixel with no observations has an all-gap row, so
+  # U[i,:] = 0 and it reconstructs to exactly the mean forever. Un-standardized, that is a
+  # smooth, seasonal, entirely plausible time series that nothing in the output distinguishes
+  # from a real reconstruction. 161 pixels here are in that position.
+  min_pixel_obs: 1
+
+  # Minimum observed pixels for a DATE's observations to be used. Dates below this are MASKED,
+  # not dropped: the column stays on the axis and gets filled by the filter like the 180 empty
+  # days, so the output keeps a complete daily axis. 8 dates fall below 200 here -- the
+  # thinnest have 18 and 22 pixels -- and together they are 0.019% of the data. A column that
+  # sparse contributes almost nothing to the covariance while pinning 18 values that no other
+  # pixel can corroborate.
+  min_date_obs: 200
+
+  # TUNING MODE. Block-average the field by this factor before building the matrix: 1 = full
+  # 100 m resolution, 4 = 400 m. `m` falls by the square of it (55,561 -> ~3,500 at 4), so
+  # every term that scales with the pixel count gets that much cheaper.
+  #
+  # The speedup is well short of f^2, and two things are worth knowing before relying on it:
+  #
+  #   - `eigh` and the temporal filter act on the (n, n) covariance and do not care about
+  #     pixel size, so they are unchanged. The more filtering you use, the less this buys.
+  #   - It does NOT reduce the ITERATION count, which is what currently dominates. Convergence
+  #     is set by diffusion across the empty columns -- purely temporal, and blind to
+  #     resolution. Each iteration gets cheaper; you still need the same number of them.
+  #
+  # The inverse transform is approximate here: seasonal coefficients block-average exactly
+  # (the seasonal field is linear in them), but the per-pixel scale does not, because
+  # averaging f^2 cells reduces variance below the mean of the cell variances. So a coarsened
+  # run gives a slightly damped field. Use it to FIND k and p, then rerun at 1 for the field
+  # you ship. `carry` is skipped when this is above 1, since those channels are on the source
+  # grid; only the coarsened water mask is written.
+  coarsen: 4
+
+# ------------------------------------------------------------------ filter
+# The diffusion filter on the temporal covariance -- the "e" in eDINEOF, and on this data it
+# is doing nearly all the work: 180 of the 365 days have NO observations, and for an all-gap
+# column B[:,j] = 0 so V[j,:] = 0 and plain DINEOF returns exactly the mean. The filter is the
+# only thing that couples those days to their neighbours.
+filter:
+  # TARGET CUTOFF PERIODS, in days. Variability faster than T_c is suppressed, and
+  # T_c = 2*pi*sqrt(alpha*p) -- so (alpha, p) is a redundant parameterisation and this grid is
+  # stated in the quantity that actually matters. alpha and p are DERIVED per entry.
+  #
+  # Measured at fixed alpha*p, varying the split from alpha=0.1/p=2 to alpha=0.002/p=100: the
+  # convergence delta after 400 iterations was identical to three digits (5.03e-3 vs 5.12e-3)
+  # while wall-clock rose 5.7x, because the filter runs p times per EM iteration. So for any
+  # target reach there is exactly one sensible choice -- the largest alpha the stability limit
+  # allows, giving the smallest p -- and the code picks it. That also caps the cost of the long
+  # reaches: 11 days needs p=13 here, against p=32 under the old fixed-alpha grid.
+  #
+  # T_c = 0 is the no-filter baseline and is not a throwaway: with no filter a held-out day
+  # reconstructs to exactly 0 in z, i.e. exactly its seasonal climatology. Every other entry
+  # has to beat it, and the run warns loudly if none does.
+  # An entry is either a cutoff period in days (alpha/p derived as above) or an explicit
+  # [alpha, p] pair used verbatim. The pair form exists to reproduce a published setting: the
+  # method paper's reference values are [0.01, 3], which is T_c = 1.09 d. The derivation would
+  # reach the same T_c with alpha=0.0296/p=1 at a third of the filter cost, and the equal-T_c
+  # measurement says those are numerically interchangeable -- so the pair is kept for
+  # provenance, not because it behaves differently.
+  t_c_grid: [0, [0.01, 3], 2, 4, 6, 8, 11]
+
+  # Ceiling on the derived alpha. 0.25 = stability_factor * min(dt)^2 for a daily axis.
+  alpha_max: 0.25
+
+  # alpha <= stability_factor * min(dt)^2.
+  #
+  # 0.25, NOT the doc's 0.5. At exactly min(dt)^2/2 the (1 - 2*alpha) self-term vanishes and
+  # the kernel becomes a parity comb -- measured at p=10: weight 0.00000 at +-1 day, 0.833 at
+  # +-2, support 11 instead of 21. Half the days get no weight at all, and the Nyquist mode
+  # flips sign every iteration forever instead of decaying. At 0.25 the Fourier symbol is
+  # cos^2(k/2), non-negative and monotone, which is what a smoother should be.
+  stability_factor: 0.25
+
+# ------------------------------------------------------------------ modes
+modes:
+  # MODE COUNTS to try, explicit and non-uniform: dense where the CV curve turns, sparse
+  # above it. Going from k=30 to k=40 changes the reconstruction far less than going from 3 to
+  # 4, while costing the most per fit -- so testing every integer at the top would spend most
+  # of the run learning the least. This reaches k=40 in 13 fits instead of 40.
+  k_grid: [1, 2, 3, 4, 5, 7, 9, 11, 15, 20, 25, 30, 40]
+
+  # parsimonious = the smallest k whose CV error is within rel_tol of the best; best = argmin.
+  # DINEOF CV curves are notoriously flat near the optimum, so the argmin is often a coin toss
+  # between several k that differ by well under 1%, and the smaller model is better
+  # conditioned and cheaper.
+  rule: parsimonious
+  rel_tol: 0.01
+
+  # Stop the k search after this many consecutive rises in the point-CV error.
+  patience: 3
+
+  # projection: sigma = ||X V||, so the reconstruction is the exact orthogonal projection of X
+  #   onto span(V). Least-squares optimal given the basis.
+  # reference:  sigma = sqrt(lambda), what the original Fortran does. Diffusion reduces
+  #   variance, so sqrt(lambda) <= ||X V|| and every mode amplitude comes out damped.
+  # Identical when the filter is off.
+  sigma_convention: projection
+
+  # Pin each mode's sign by its largest-magnitude temporal entry. Eigenvector signs are
+  # arbitrary and flip between runs; U flips with V so the reconstruction is unaffected, but
+  # modes are only comparable across runs if the convention is fixed.
+  fix_sign: true
+
+# ------------------------------------------------------------------ em
+em:
+  tol: 1.0e-3         # RMS change in the filled values, relative to the data sd
+  # 250, not 100: at k=7/p=10 the fit was still moving at the 100-iteration cap (delta
+  # 6.4e-3 against this tol), so the reported reconstruction was not a fixed point.
+  max_iter: 250       # hitting this is warned about, not silently accepted
+
+# ------------------------------------------------------------------ cv
+# TWO holdouts, because they answer different questions and neither can substitute.
+cv:
+  # POINT holdout: this fraction of the points in days that still have data, held out with
+  # donor geometry (a real gap mask pasted from another day, so the held-out shape is a
+  # contiguous cloud rather than scattered pixels each surrounded by data -- the doc is
+  # explicit in §6 that uniform-random points are optimistic). SELECTS k.
+  frac: 0.02
+
+  # DAY holdout: this fraction of the days that have data, held out WHOLE. SELECTS p.
+  #
+  # Separate from the point holdout because the point holdout is structurally blind to what
+  # the filter does: its pixels sit in days whose temporal modes are already pinned by their
+  # own surviving pixels, so filtering can only pull those modes toward their neighbours --
+  # i.e. distort them. Scored on points alone the optimum is always p = 0 and eDINEOF quietly
+  # degrades to DINEOF. A whole held-out day has no pixels of its own, so it is reconstructed
+  # entirely by the filter, which is exactly the situation of the 180 empty days.
+  #
+  # Set to 0 to disable and reproduce the doc's single-CV setup; the run then warns that p is
+  # being chosen on a criterion that cannot see it.
+  day_frac: 0.10
+
+  # Guards on the donor paste, which is otherwise unbounded: a sparse donor pasted onto a
+  # dense target holds out nearly the whole target day, blowing the budget and possibly
+  # emptying the day -- recreating the zero-column degeneracy on a day meant to be scoring.
+  max_date_frac: 0.4          # never hold out more than this share of one day
+  min_date_obs_after: 50      # never leave a day with fewer than this many observations
+  donor_lo: 0.5               # draw donors whose coverage is in
+  donor_hi: 0.95              #   [donor_lo, donor_hi] * the target's
+
+  seed: 0
+
+# ------------------------------------------------------------------ carry
+carry:
+  - landcover_water
+  - sst_composite             # the observations, for a direct before/after comparison
+  - sst_seasonal_sd
+  - depth_cudem
+  - elevation_cudem
+
+# ------------------------------------------------------------------ output
+output:
+  chunks: {time: 64, y: 128, x: 128}
+  compression: {codec: zstd, level: 5, shuffle: shuffle}
+  modes_file: dineof_modes.nc     # U, sigma, V scattered back onto the grid
+  report: dineof_cv.csv           # one row per (p, k): both CV curves, iterations, convergence
+
+  write_figures: true
+  fig_dir: figures/edineof
+
+  # The two CV curves, and the number that decides whether this stage earned its place: the
+  # day-CV at p=0, which is the seasonal climatology stage 5 removed.
+  figure_cv: true
+
+  # How the FINAL fit converged, split by whether a date had any observation of its own.
+  # The split is the point: a date with pixels has its temporal mode pinned by its own data and
+  # settles fast, while a date with none is filled purely by the filter diffusing in from its
+  # neighbours and converges on the diffusion timescale. The single `delta` that em.tol tests
+  # pools both, so it reports the slow half as if it were the whole field.
+  figure_convergence: true
+
+  # Leading spatial modes over their temporal amplitudes.
+  figure_modes: true
+
+  # Every reconstructed day on one sheet, chronological, with the unconstrained days marked.
+  figure_contact: true
+
+  figure_dpi: 130
+  figure_ncols: 12

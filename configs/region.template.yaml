@@ -1,0 +1,130 @@
+# TEMPLATE for a new region. Copy to configs/region.<aoi>.yaml and fill in the REQUIRED keys;
+# everything else has a default (shown here with its value).
+#
+#   python src/run_region.py --config configs/region.<aoi>.yaml all
+#
+# The source cube is a coastal_sst_data datacube holding MODIS Aqua (the composite anchor),
+# ECOSTRESS and Landsat SST with their QC channels, the water mask and depth. Channel names
+# below are coastal_sst_data's defaults.
+
+region:
+  aoi: my_region                                  # REQUIRED: names the output directory
+  source: data/unfiltered/my_region.zarr          # REQUIRED: the source datacube
+  out_dir: data/regions
+  watervar: landcover_water
+  time_range: null                                # [YYYY-MM-DD, YYYY-MM-DD] or null for all
+  carry: [landcover_water, depth_cudem, elevation_cudem]
+
+# ------------------------------------------------------------------ stage 1: offsets
+offsets:
+  aggregate: footprint        # footprint | pixel
+  min_footprints: 10          # footprint pairs a scene needs
+  min_footprint_cells: 20     # water + MODIS-valid cells a footprint needs
+  min_footprint_cover: 0.5    # share of those the sensor observed and kept
+  min_pixels: 200             # pixel mode only
+  max_abs_delta: 8.0          # a scene whose offset exceeds this is rejected
+  smooth_to_reference_px: 0   # pixel mode only
+  outlier_k: 1.5              # within-scene clipping, x robust SD; null disables
+  outlier_max_iter: 20
+  mode: auto                  # auto | fixed | rma
+  recommend_min_gain: 0.02    # rma must beat fixed's leave-one-scene-out RMSE by this share
+  slope_clip: [0.5, 2.0]
+  n_boot: 200
+
+# ------------------------------------------------------------------ stage 2: DINEOF + cloud filter
+# Sensors: one block per high-resolution sensor. Ids are free-form but used in output names.
+sensors:
+  eco:
+    label: ECOSTRESS v002
+    sst: eco_sst_v002
+    valid: eco_valid_v002
+    cloud: eco_cloud_v002
+    hour: eco_hour_v002
+    min_pixels: 64
+    qc_nodata_prior: 0.5      # ECOSTRESS drops QC-rejected pixels, so its gaps carry a cloud prior
+  lst:
+    label: Landsat
+    sst: lst_sst
+    valid: lst_valid
+    cloud: lst_cloud
+    hour: lst_hour
+    min_pixels: 64
+    qc_nodata_prior: null
+
+reference:                    # the composite anchor and the source of the smooth field
+  id: modis
+  var: modis_sst_aqua
+  valid: modis_valid_aqua
+  hour: modis_hour_aqua
+
+detector:                     # the per-scene cloud classifier (see configs/region.admiralty_inlet.yaml)
+  ref_var: modis_sst_aqua
+  depthvar: depth_cudem
+  tidal_depth_m: 3.0
+  clear: {sd: 0.75, sd_floor: 0.71}
+  qc: {enabled: true, prior_cloud: 0.9, nodata_prior: null}
+  mixture: {lambda_cloud: 4.0, min_dev_cold: 0.0, prior_cloud: 0.1, lambda_hot: 6.5,
+            min_dev_hot: 0.0, prior_hot: 0.005, p_h_tidal: 0.5, beta_cloud: 1.75,
+            n_sweeps_cloud: 20, beta_hot: 0.125, n_sweeps_hot: 10, estep_damp: 0.5,
+            p_floor: 0.01}
+
+filter:
+  p_valid_min: 0.5
+  offset_lower: -2.0          # a scene offset against the smooth field outside this band
+  offset_upper: 4.0           #   drops the whole scene
+  min_kept_frac: null
+  require_qc: true
+  valid_range: [271.0, 310.0] # K; gross range check folded into the QC flag
+
+composite:
+  min_members: 1
+  weights: {modis: 1.0, eco: 1.0, lst: 1.0}
+  hold: [lst, eco]
+  block_days: 30              # memory: days composited at a time
+
+holdout:                      # high-res scenes held out for the point CV
+  frac: 0.2
+  hold: [lst, eco]
+  valid_pixels: 0.5
+  seed: 0
+
+seasonal: {n_harmonics: 1, period_days: 365.25, min_dates: 10, max_cond: 100.0}
+scale: {estimator: mad, floor: 0.5, dof_correction: true, fallback: median}
+
+dineof:
+  matrix: {min_pixel_obs: 1, min_date_obs: 200, coarsen: 4}
+  filter: {t_c_grid: [0, [0.01, 3], 2, 4, 6, 8, 11], alpha_max: 0.25, stability_factor: 0.25}
+  modes: {k_grid: [1, 2, 3, 4, 5, 7, 9, 11, 15, 20, 25, 30, 40], rule: parsimonious,
+          rel_tol: 0.01, patience: 3, sigma_convention: projection, fix_sign: true}
+  em: {tol: 1.0e-3, max_iter: 250}
+  cv: {frac: 0.02, day_frac: 0.10, seed: 0}
+
+loop:
+  strategy: fixed             # fixed | ends | every
+  k: 2
+  t_c: 7.0
+  baseline: day
+  max_iter: 8
+  tol: 1.0e-3
+  patience: 1
+  baseline_source: modis      # smooth field from MODIS-only loadings
+  loading_tc: null
+  loading_ridge: 1.0e-3
+  loading_min_px: 5
+
+final:
+  coarsen: 1                  # native resolution
+  em: {max_iter: 250}
+  reclassify: false
+
+output:
+  chunks: {time: 64, y: 128, x: 128}
+  compression: {codec: zstd, level: 5, shuffle: shuffle}
+  write_figures: true
+  figure_dpi: 130
+
+# ------------------------------------------------------------------ stage 3: validation
+validation:
+  insitu: null                # netCDF / CSV path, or null to use the cube's insitu_* channels
+  products: [sst_filled, sst_filled_point, sst_filled_day, sst_smooth]
+  match: {max_dt_min: 60.0, min_coverage: 0.75, max_snap_m: 300.0}

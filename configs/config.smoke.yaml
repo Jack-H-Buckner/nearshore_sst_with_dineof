@@ -1,0 +1,93 @@
+# Prototype dataset for the spatial cloud mixture model (docs/spatial-cloud-mixture-model.md).
+#
+# One 30x30 km AoI over Admiralty Inlet, north Puget Sound, at 100 m, for one season
+# (May-July 2025). Deliberately minimal: Landsat + ECOSTRESS thermal, the landcover water
+# mask the model needs to restrict itself to ocean, the daily MODIS Aqua night series
+# (surface constraint), and HRRR met-at-overpass (cloud priors). MUR is NOT acquired -- it
+# reads too warm in this kind of coastal water, which is the failure the mixture model
+# exists to replace.
+#
+#   coastal-sst-data validate --config prototypes/cloud_mixture_model/configs/config.admiralty.yaml
+#   coastal-sst-data run      --config prototypes/cloud_mixture_model/configs/config.admiralty.yaml --assemble
+
+name: SMOKETEST
+
+# Absolute, because output_dir is resolved against the CWD, not against this file.
+output_dir: s3://cetocean-maps-timeseries-store-dev/raw_data/smoke
+
+time:
+  start_date: "2023-09-01"
+  end_date: "2023-10-01"
+
+auth:
+  earthdata:
+    auth_strategy: netrc      # ECOSTRESS. Landsat/landcover go through PC, anonymously.
+
+grid:
+  resolution_m: 100
+  target_crs: auto            # -> EPSG:32610 (UTM 10N) for this AoI
+  resampling_continuous: bilinear
+  resampling_categorical: nearest
+  snap_origin: true
+
+products:
+  # CUDEM bathymetry/topography. The exposed-intertidal component needs to know WHICH cells
+  # can dry, and distance-to-shore is only a proxy for that: a broad tide flat stays a metre
+  # above MLLW hundreds of metres from the shoreline, where exp(-d/3px) has already decayed
+  # to nothing. Elevation is the actual determinant. Also ships the DEM->MSL datum offset,
+  # which is what makes elevation comparable to a tide height later (plan Phase 3).
+  landsat:
+    source: pc                # landsat-8 + landsat-9 (2013-onwards) by default
+    masking:
+      cloud_buffer_km: 0.0
+  ecostress:
+    # v002 ONLY. Measured with --dry-run on this AoI/window: v003 returns 0 granules for
+    # May-July 2025 and v002 returns 100, so listing v003 would only add an all-NaN
+    # eco_sst_v003 channel set for the model to trip over.
+    versions: [v002]
+  landcover:
+    source: esa
+    year: 2021
+    water_classes: [80]      
+  met_overpass:
+    sources: [hrrr]
+    variables: [wind, cloud]
+    combinations: [[lst, hrrr], [eco, hrrr]]
+  modis:
+    platforms: [aqua]
+    time_of_day: night
+    access: download
+  mur:
+    variable: analysed_sst
+
+datacube:
+  chunks: { time: 64, y: 128, x: 128 }
+
+# The prototype reads the RAW channels: <pre>_sst keeps cloud-contaminated values, and
+# <pre>_valid / <pre>_cloud are kept aside as an independent reference to score against.
+preprocess:
+  enabled: false
+
+regions:
+  - name: puget_sound     # CONUS coverage; ships depth_cudem / elevation_cudem
+    areas:
+      # buffer_*_km are HALF-extents, so 15/15 is a 30 x 30 km box:
+      #   48.050 .. 48.320 N, -122.853 .. -122.447 W
+      - name: admiralty_inlet
+        center_lat: 48.185
+        center_lon: -122.65
+        buffer_ns_km: 25
+        buffer_ew_km: 25
+
+preprocess:
+  enabled: false
+  # Memory blocking, exactly as datacube.block_days / memory_budget_gb -- this stage reads a whole
+  # cube and writes a larger one, so it has the same problem. Unset -> inherit the datacube value.
+  # Set them when preprocessing needs a smaller block than assembly did, which it can: it holds
+  # the channels it READS as well as the ones it derives.
+  #block_days: auto
+  memory_budget_gb: 8
+  steps:
+    flag_georef: { sensors: [eco], tol_m: 200, max_shift_m: 10000, min_coast_obs: 500, min_edges: 300}
+    correct_georef: { sensors: [eco], fields: [sst, valid] }
+

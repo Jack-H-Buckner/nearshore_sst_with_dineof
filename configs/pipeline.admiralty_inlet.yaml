@@ -1,0 +1,233 @@
+# End-to-end pipeline for Admiralty Inlet: raw cube in, filled + smooth + cloud filter out.
+#
+#   python src/pipeline.py --config configs/pipeline.admiralty_inlet.yaml
+#   ... --tag e2e --max-iter 4
+#
+# Then validate against in situ:
+#
+#   python src/validate_insitu.py --cube data/pipeline/admiralty_inlet_pipeline.zarr \
+#       --insitu data/insitu/admiralty_inlet_insitu.nc
+#
+# The detector / sensors / reference / filter / composite / dineof / loop sections are the
+# iterative filter's, validated by iterative_filter.build_config. Relative paths resolve
+# against the repo root.
+
+data:
+  aoi: admiralty_inlet
+  source: data/unfiltered/admiralty_inlet.zarr
+  out_dir: data/pipeline
+  watervar: landcover_water
+  # The 365 days the existing products cover. null runs the whole cube (912 days); the
+  # native-resolution final fit then needs roughly 2.5x the memory.
+  time_range: [2025-03-01, 2026-02-28]
+  carry: [landcover_water, depth_cudem, elevation_cudem]
+
+# ------------------------------------------------------------------ offsets
+# composite.py's matchup and offset model, fit here against MODIS on the kept pixels.
+matchup:
+  # footprint: each MODIS footprint (reconstructed from the anchor's nearest-neighbour patches
+  # of identical value, ~1 km) against the MEDIAN of the sensor's kept pixels inside it, so a
+  # 1 km average is compared with a 1 km statistic. pixel: every 100 m cell is its own pair.
+  aggregate: footprint
+  min_footprints: 10          # footprint pairs a scene needs
+  min_footprint_cells: 20     # water + MODIS-valid cells a footprint needs (drops coastal slivers)
+  min_footprint_cover: 0.5    # share of those cells the sensor observed and kept
+  min_pixels: 200             # pixel mode only
+  max_abs_delta: 8.0
+  smooth_to_reference_px: 0   # pixel mode only
+  # Iterative outlier removal: drop pairs whose residual against their own scene's fit exceeds
+  # outlier_k x robust SD (1.4826 MAD over all pairs), refit, repeat until the removed set
+  # stops changing. null disables.
+  outlier_k: 1.5
+  outlier_max_iter: 20
+offset:
+  model: diurnal
+  max_harmonics: 1
+  max_cond: 100.0
+  loo_gate: true
+  weights: variance_components
+  slope: false
+  min_scenes: 8
+  clip: [-5.0, 5.0]
+  diurnal_harmonics: {eco: 1, lst: 1}    # requested; the cond and LOO gates may refuse
+  # With slope: true, sensor = x0 + a(hour) + b (MODIS - x0), pivoted at the median MODIS of the
+  # pairs so `a` stays the physical offset. Both estimators are always reported.
+  slope_estimator: ols        # ols | rma
+  slope_clip: [0.5, 2.0]      # a fitted slope outside this is an error
+
+# Point-CV holdout dates: hold members removed on a seeded share of the dates they cover well.
+holdout:
+  frac: 0.2
+  hold: [lst, eco]
+  valid_pixels: 0.5
+  seed: 0
+
+# ------------------------------------------------------------------ standardization
+seasonal:
+  n_harmonics: 1
+  period_days: 365.25
+  min_dates: 10
+  max_cond: 100.0
+scale:
+  estimator: mad
+  floor: 0.5
+  dof_correction: true
+  fallback: median
+
+# ------------------------------------------------------------------ detector
+# build_cube's detector block. `reference` and `covariate` configure the MODIS covariate, which
+# this process never builds -- the DINEOF field replaces it -- but they are kept so the block
+# stays a verbatim copy and the two filters differ ONLY in their baseline.
+detector:
+  ref_var: modis_sst_aqua
+  depthvar: depth_cudem
+  tidal_depth_m: 3.0
+  reference:
+    window_days: 4
+    qc_var: null
+    qc_max: 1
+    quantile: 0.5
+    min_obs: 1
+    min_cover: 0.05
+  covariate:
+    init_prior: 285.0
+    init_range_px: 200.0
+    init_marg_sd: 0.05
+    init_obs_error: 0.5
+    alpha: 2
+  clear:
+    sd: 0.75
+    sd_floor: 0.71
+  qc:
+    enabled: true
+    prior_cloud: 0.9
+    nodata_prior: null          # per-sensor; overridden from sensors.<id>.qc_nodata_prior
+  mixture:
+    lambda_cloud: 4.0
+    # 0.0 is the unary the MODIS-baseline filter was built with (the term did not exist yet),
+    # so --compare measures the baseline and nothing else. Raise to match
+    # simple_outlier_detection.yaml (0.75 / 2.0) once the MODIS filter is rebuilt with it.
+    min_dev_cold: 0.0
+    prior_cloud: 0.1
+    lambda_hot: 6.5
+    min_dev_hot: 0.0
+    prior_hot: 0.005
+    p_h_tidal: 0.5
+    beta_cloud: 1.75
+    n_sweeps_cloud: 20
+    beta_hot: 0.125
+    n_sweeps_hot: 10
+    estep_damp: 0.5
+    p_floor: 0.01
+  solver:
+    tol: 1.0e-2
+    pcg_max_iter: 25
+    precondition: true
+
+# ------------------------------------------------------------------ sensors
+# Ids must match the composite member ids: `<id>_offset` is read from the composite cube and
+# `<id>` from offsets.csv.
+sensors:
+  eco:
+    label: ECOSTRESS v002
+    sst: eco_sst_v002
+    valid: eco_valid_v002
+    cloud: eco_cloud_v002
+    hour: eco_hour_v002
+    min_pixels: 64
+    qc_nodata_prior: 0.5
+  lst:
+    label: Landsat
+    sst: lst_sst
+    valid: lst_valid
+    cloud: lst_cloud
+    hour: lst_hour
+    min_pixels: 64
+    qc_nodata_prior: null
+
+# The composite anchor: always a member, never a detection baseline, never classified.
+reference:
+  id: modis
+  var: modis_sst_aqua
+  valid: modis_valid_aqua
+  hour: modis_hour_aqua
+
+# ------------------------------------------------------------------ filter
+# build_cube's pixel cut and scene gate, with the same meaning: `center` is the scene's robust
+# offset of the RAW scene against the baseline, so the band keeps its build_cube reading.
+filter:
+  p_valid_min: 0.5
+  offset_lower: -2.0
+  offset_upper: 4.0
+  min_kept_frac: null
+  require_qc: true              # a kept pixel must also pass the sensor's own QC
+  # Gross physical range, K, folded into the sensor QC flag. The QC channels pass ECOSTRESS
+  # values up to 505 K and Landsat down to 202 K; at iteration 0 those dominate the fit the
+  # loop bootstraps from and the EM does not converge. null disables.
+  valid_range: [271.0, 310.0]
+
+composite:
+  min_members: 1
+  weights: {modis: 1.0, eco: 1.0, lst: 1.0}
+  hold: [lst, eco]              # removed on validation dates, as composite.py does
+  # Days composited at a time; the composite's peak memory scales with this, the result
+  # does not. Whole-record (365) it is ~4 GB on this 303 x 303 grid; at 30 each matrix
+  # build peaks near 1 GB in total. Lower it on a small machine, raise it on a large one.
+  block_days: 30
+
+# ------------------------------------------------------------------ dineof
+# edineof's own sections, used for every fit and every CV search in the loop.
+dineof:
+  matrix:
+    min_pixel_obs: 1
+    min_date_obs: 200
+    coarsen: 4                  # the loop runs coarse; the end-of-run chain runs full res
+  filter:
+    t_c_grid: [0, [0.01, 3], 2, 4, 6, 8, 11]
+    alpha_max: 0.25
+    stability_factor: 0.25
+  modes:
+    k_grid: [1, 2, 3, 4, 5, 7, 9, 11, 15, 20, 25, 30, 40]
+    rule: parsimonious
+    rel_tol: 0.01
+    patience: 3
+    sigma_convention: projection
+    fix_sign: true
+  em:
+    tol: 1.0e-3
+    max_iter: 250
+  cv:
+    frac: 0.02
+    day_frac: 0.10
+    seed: 0
+
+# ------------------------------------------------------------------ loop
+loop:
+  strategy: fixed               # fixed | ends | every
+  k: 2                          # `fixed` only: the coarse day-opt selection on this AoI
+  t_c: 7.0                      # `fixed` only, days
+  baseline: day                 # which CV fit's lowrank is the baseline under ends / every
+  max_iter: 8
+  tol: 1.0e-3                   # stop when every sensor's flip fraction is below this ...
+  patience: 1                   # ... for this many consecutive iterations
+  final_cv: true                # full CV search on the final mask (fixed / ends)
+  # modis: the modes U are fit on every member, but each day's loadings on MODIS pixels
+  # only, so ECOSTRESS / Landsat shape the EOFs without steering the field that filters them.
+  # all: the full-data low-rank field U diag(sigma) V' (day j's own scene pulls on V[j]).
+  baseline_source: modis
+  loading_tc: null              # days of pooling for the MODIS loadings; null = the fit's T_c
+  loading_ridge: 1.0e-3         # relative Tikhonov lambda on the per-day solve
+  loading_min_px: 5             # MODIS matrix cells a day needs to contribute
+
+
+# ------------------------------------------------------------------ final fill
+final:
+  coarsen: 1              # native 100 m, warm-started from the dineof.matrix.coarsen loop
+  em: {max_iter: 250}
+  reclassify: false       # true: one more cloud classification against the final smooth field
+
+output:
+  chunks: {time: 64, y: 128, x: 128}
+  compression: {codec: zstd, level: 5, shuffle: shuffle}
+  write_figures: true
+  figure_dpi: 130

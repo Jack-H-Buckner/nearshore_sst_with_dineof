@@ -1,0 +1,211 @@
+# Build the filtered DINEOF input cube for Admiralty Inlet.
+#
+#   python prototypes/DINEOF/src/build_cube.py \
+#       --config prototypes/DINEOF/configs/config.build_cube.admiralty_inlet.yaml
+#   ... --dry-run        # print the per-scene verdict table, write nothing
+#   ... --limit 6        # first N acquisitions per sensor, for a smoke test
+#   ... --refresh        # re-run the detector even where the cache is current
+#
+# Every key outside `detector`, `sensors` and `carry` is validated two levels deep; an unknown
+# key is an error, not a silent default. `detector` is validated against
+# simple_outlier_detection.DEFAULTS, `sensors` one level per sensor, `carry` as a list of
+# channels that must exist in the source cube.
+# Relative paths resolve against prototypes/DINEOF.
+#
+# TWO STAGES, WITH A CACHE.
+#   1. The detector runs once per acquisition and writes a .nc into output.cache_dir.
+#   2. This process reads those, applies `filter`, and writes the cube.
+# The cache key is the DETECTOR settings only -- `filter` and `output` are excluded -- so
+# retuning a threshold re-reads the cache in seconds instead of re-running the mixture model
+# over 212 acquisitions (~9 min). Changing anything under `detector` invalidates it.
+
+data:
+  aoi: admiralty_inlet
+  cube: ../cloud_mixture_model/data/datacube/admiralty_inlet.zarr   # source, read-only
+  out: data/datacube/admiralty_inlet_filtered.zarr                  # destination
+  watervar: landcover_water
+
+# ------------------------------------------------------------------ detector
+# Handed to simple_outlier_detection verbatim; section and key names match its DEFAULTS
+# exactly. This is its config MINUS the per-sensor data.* channel names (which live under
+# `sensors` below, because they differ per sensor) and MINUS its output.* (which this process
+# owns). `offset` is absent on purpose: the scene gate lives in `filter` and is applied here
+# from the stored `center`, so the band can change without invalidating the cache.
+detector:
+  ref_var: modis_sst_aqua
+  depthvar: depth_cudem
+  tidal_depth_m: 3.0
+
+  reference:
+    # +/-4 days, not +/-1. modis_sst_aqua is finite on 123 of 365 days and covers a median of
+    # only 7% of AoI water, so a +/-1 day window leaves many acquisitions with NO covariate at
+    # all -- the six March dates all came back "0.0% of water pixels had reference data".
+    window_days: 4
+    qc_var: null
+    qc_max: 1
+    quantile: 0.5
+    min_obs: 1
+    min_cover: 0.05             # below this, ref_flag is set (see filter.require_reference)
+  covariate:
+    init_prior: 285.0
+    init_range_px: 200.0
+    init_marg_sd: 0.05
+    init_obs_error: 0.5
+    alpha: 2
+  clear:
+    sd: 0.75
+    sd_floor: 0.71
+  qc:
+    enabled: true
+    prior_cloud: 0.9
+    nodata_prior: null          # per-sensor; overridden from sensors.<id>.qc_nodata_prior
+  mixture:
+    lambda_cloud: 4.0
+    # Baseline cloud prior on pixels the sensor QC does NOT flag. 0.5 is an even bet before any
+    # evidence; at 0.1 an unflagged pixel starts out presumed clear and the residual has to
+    # argue it into cloud. Lowered because the filter was removing coherent cold water masses
+    # that the covariate -- smoothed at a 20 km range -- cannot represent (see 2025-06-02).
+    prior_cloud: 0.1
+    lambda_hot: 6.5
+    prior_hot: 0.005
+    p_h_tidal: 0.5
+    beta_cloud: 1.75
+    n_sweeps_cloud: 20
+    beta_hot: 0.125
+    n_sweeps_hot: 10
+    estep_damp: 0.5
+    p_floor: 0.01
+  solver:
+    tol: 1.0e-2
+    pcg_max_iter: 25
+    precondition: true
+
+# ------------------------------------------------------------------ sensors
+sensors:
+  eco:
+    label: ECOSTRESS v002
+    sst: eco_sst_v002
+    valid: eco_valid_v002
+    cloud: eco_cloud_v002
+    hour: eco_hour_v002         # (time,) overpass hour UTC; carried automatically
+    min_pixels: 64              # finite water px for a day to count as an acquisition
+    # ECOSTRESS DROPS the pixels its QC rejects rather than keeping them, so eco_cloud_v002
+    # survives on NaN SST pixels and separates cloud gaps from never-retrieved gaps. Landsat's
+    # does not. This is the one detector key that genuinely differs between the two sensors.
+    qc_nodata_prior: 0.5
+  lst:
+    label: Landsat
+    sst: lst_sst
+    valid: lst_valid
+    cloud: lst_cloud
+    hour: lst_hour              # spans 18.9-19.03 UTC: no diurnal term is identifiable, which
+                                # the composite stage detects rather than assumes
+    min_pixels: 64
+    qc_nodata_prior: null       # treat every Landsat gap alike
+
+# ------------------------------------------------------------------ filter
+# What survives into the cube. Changing anything here is cheap: the cache is not invalidated.
+filter:
+  # PER-PIXEL. Keep pixels whose P(clear) is at least this. Everything else becomes NaN.
+  # Lowered from 0.8: a pixel now needs less confidence to count as valid. This is the highest
+  # -leverage knob in the file and it is cache-free -- at 0.8 the median scene retained 66%
+  # (eco) / 31% (lst) of observed water, at 0.5 it is 74% / 39%.
+  p_valid_min: 0.5
+
+  # PER-SCENE. The scene's `center` -- its robust offset against the MODIS covariate, in K --
+  # must fall in [lower, upper] or the whole image is dropped. Asymmetric on purpose: a scene
+  # reading warm against a coarse daily night-time composite is ordinary for a high-resolution
+  # daytime overpass, while a cold offset is far more likely to be contamination. null on
+  # either bound disables that side.
+  offset_lower: -2.0
+  offset_upper: 4.0
+
+  # Drop scenes whose MODIS coverage fell below detector.reference.min_cover.
+  #
+  # SHIPPED OFF, deliberately, and worth understanding before leaving it that way: with no
+  # reference the SPDE returns covariate.init_prior, so the detector compares the scene to a
+  # CONSTANT and both its p_valid and its center are meaningless. Such a scene can land inside
+  # the offset band by accident and be admitted with a garbage pixel mask. The build logs a
+  # warning naming every admitted scene with ref_flag set, and filter_report.csv carries
+  # ref_cover for all of them, so the risk is visible rather than silent. Set true to arm.
+  require_reference: false
+
+  # Minimum fraction of AoI WATER that must survive the p_valid cut for the scene to be kept.
+  # null = no minimum. A scene retaining 3% of the water adds almost nothing to a DINEOF
+  # reconstruction but still costs a column.
+  min_kept_frac: null
+
+# ------------------------------------------------------------------ carry
+# EXTRA channels copied from the source cube UNCHANGED -- not masked, not rescaled. Verified
+# byte-identical against the source after the write.
+#
+# Each sensor's own raw SST is written automatically and must NOT be listed here: every sensor
+# contributes a PAIR to the cube, the raw channel under its original name plus the filtered
+# one under <name><output.filtered_suffix>. So eco_sst_v002 (raw) sits beside
+# eco_sst_v002_dineof (the DINEOF input), and the filter stays auditable and reversible from
+# the cube alone.
+#
+# MODIS is NOT a sensor block: no detector runs on it, because it IS the reference the detector
+# compares against. It reaches the cube here, and the composite stage picks its variables up
+# from its own `members:` config. Adding MODIS Terra is three names here plus one members block.
+#
+# Note there is deliberately no masked `modis_sst_aqua_dineof` counterpart: modis_sst_aqua is
+# finite on EXACTLY the pixels where modis_valid_aqua > 0.5 (checked over all 867,070 of them,
+# zero disagreement), so a masked copy would differ only by the water mask -- 4,624 px, 0.5% --
+# which the composite stage applies anyway. It would be a 134 MB duplicate of an identical array.
+carry:
+  - modis_sst_aqua              # the coarse daily reference; DINEOF is anchored against it
+  - modis_valid_aqua            # its QC; the composite stage masks on it
+  - modis_hour_aqua             # its overpass hour -- a night-time local retrieval
+  - landcover_water             # the water mask every consumer needs
+  - depth_cudem
+  - elevation_cudem
+
+# ------------------------------------------------------------------ output
+output:
+  cache_dir: outputs/outlier_cache          # <cache_dir>/<sensor>/<var>_<date>.nc
+  chunks: {time: 64, y: 128, x: 128}        # matches the source cube's on-disk chunking
+  compression: {codec: zstd, level: 5, shuffle: shuffle}
+  report: filter_report.csv                 # written next to the cube; the table view of
+                                            # everything the figures below draw
+
+  # ---------------------------------------------------------------- figures
+  # What the filter flagged, made visible. Skipped entirely by --dry-run.
+  #
+  # NOT to be confused with write_detector_figures below, which is the DETECTOR's own 6-panel
+  # diagnostic (obs / covariate / residual / q_cloud / q_hot / p_valid) written during stage 1.
+  # These are the FILTER's views, drawn in stage 2 from the cache.
+  write_figures: true                       # master switch for the three below
+  fig_dir: figures/build_cube               # figures land in <fig_dir>/<aoi>/
+
+  # PER-PIXEL. One figure per acquisition: the raw field with removed pixels painted over it,
+  # the p_valid evidence, and what survives. Filenames are prefixed kept_/dropped_ so the two
+  # groups sort apart. The expensive one -- ~90 s for 212 scenes -- so turn it off while
+  # sweeping a threshold and back on for the review.
+  figure_scenes: true
+
+  # PER-IMAGE. One contact sheet per sensor, every scene sorted by its offset and framed by
+  # verdict, so the accepted band reads as a seam that moves when you retune it.
+  figure_contact: true
+
+  # THE SCENE GATE's tuning instrument: offset against the fraction of water that survives,
+  # one point per scene, with the accepted band shaded. A point sitting high and just outside
+  # the band is an image worth arguing about.
+  figure_offsets: true
+
+  # DEVIATION FROM THE COVARIATE -- the classifier's own decision space. Stacked histogram of
+  # the residual per scene, kept in blue and removed in magenta, with the assumed clear-sky
+  # sigma shaded. The split is deliberately NOT a clean cut in this space: the mixture reads a
+  # QC prior and runs 20 Ising sweeps, so neighbours help decide each pixel. How far the two
+  # colours interleave is the honest measure of how much the spatial term drove the call.
+  figure_scene_hist: true                   # as a 5th panel on each scene figure
+  figure_histograms: true                   # and as one grid sheet per sensor, for scanning
+
+  figure_dpi: 130                           # per-scene figures
+  figure_ncols: 8                           # contact-sheet columns
+
+  write_detector_figures: false             # the detector's own 6-panel diagnostic, per date
+  # Names the filtered counterpart of each sensor channel: eco_sst_v002 -> eco_sst_v002_dineof.
+  # The raw channel keeps its original name, so it stays directly comparable with the source
+  # cube. This is the channel to feed DINEOF.
+  filtered_suffix: _dineof

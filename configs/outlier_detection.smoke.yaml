@@ -1,0 +1,101 @@
+# Run the cloud_mixture_model outlier detector over the DINEOF filtering smoke-test dates.
+#
+#   python prototypes/cloud_mixture_model/src/outlier_detection.py \
+#       --config prototypes/DINEOF/configs/outlier_detection.smoke.yaml
+#
+# WHY this config exists rather than reusing configs/outlier_detection.yaml: that one screens
+# `lst_sst` and writes into the cloud_mixture_model tree. This screens `eco_sst_v002` -- the
+# channel the DINEOF filter is being tuned on -- over exactly the six acquisitions the
+# `--limit 6` smoke test draws, and writes into the DINEOF tree so the two prototypes' outputs
+# do not mix.
+#
+# The question it answers: the scene-level criteria in config.filtering.admiralty_inlet.yaml
+# gate on eco_valid_v002 (QC bits only) and eco_cloud_v002 (a near-binary raster). Neither
+# sees HAZE -- a thin, spatially smooth cold bias that leaves a pixel flagged perfectly valid.
+# The mixture model works on the residual against a MODIS covariate, so it can. Scenes this
+# flags heavily but the filter PASSES are the false negatives the filter needs to learn about.
+#
+# Everything below except data.var/dates and output.* is copied from
+# prototypes/cloud_mixture_model/configs/outlier_detection.yaml, deliberately unchanged, so
+# what this run catches is attributable to the scene choice and not to retuned parameters.
+#
+# Relative paths resolve against prototypes/cloud_mixture_model (the SCRIPT's root, not this
+# file's); the output paths are absolute so they land in DINEOF regardless.
+
+data:
+  cube: data/datacube/admiralty_inlet.zarr
+  var: eco_sst_v002             # the channel the DINEOF filter screens
+  ref_var: modis_sst_aqua
+  landvar: landcover_water
+  depthvar: depth_cudem
+  tidal_depth_m: 3.0
+  # NOT the `--limit 6` smoke dates (2025-03-01/04/05/07/09/11). Those were tried first and
+  # every one of them reported "0.0% of water pixels had reference data": modis_sst_aqua is
+  # finite on 123 of 365 days but covers a median of only 7% of the AoI water, and the +/-1
+  # day window caught none of them. Without a covariate the detector fits a flat prior and
+  # its verdicts mean nothing, so those runs are not evidence of anything.
+  #
+  # 65 of the 68 passing ECOSTRESS scenes DO have MODIS within +/-1 day, so this is a bad
+  # window rather than a broken method. These six are chosen for covariate coverage and to
+  # span the filter's verdicts:
+  #
+  #   2025-04-18  valid 0.967  clear 0.987  PASS   the filter calls these pristine; if the
+  #   2025-04-23  valid 0.966  clear 0.984  PASS   mixture flags haze here, it is a FALSE
+  #   2025-10-02  valid 0.945  clear 0.965  PASS   NEGATIVE the scene criteria cannot see
+  #   2025-06-15  valid 0.690  clear 0.707  PASS   mid-confidence pass
+  #   2025-08-08  valid 0.520  clear 0.543  PASS   marginal pass, best covariate (0.47)
+  #   2025-05-25  valid 0.451  clear 0.470  FAIL   control: the filter already rejects it
+  dates: ["2025-04-18", "2025-04-23", "2025-10-02", "2025-06-15", "2025-08-08", "2025-05-25"]
+  min_pixels: 64
+
+output:
+  dir: /Users/johnbuckner/github/coastal_sst_data/prototypes/DINEOF/outputs/outlier_check
+  fig_dir: /Users/johnbuckner/github/coastal_sst_data/prototypes/DINEOF/figures/outlier_check/admiralty_inlet
+  write_netcdf: true
+  write_figures: true
+
+reference:
+  window_days: 1
+  qc_var: null
+  qc_max: 1
+  quantile: 0.5
+  min_obs: 1
+
+covariate:
+  init_prior: 285.0
+  init_range_px: 200.0
+  init_marg_sd: 0.05
+  init_obs_error: 0.5
+
+analysis:
+  range_px: 100.0
+  marg_sd: 0.05
+  obs_error: 0.5
+  clear_sd: 0.75
+  alpha: 2
+
+mixture:
+  lambda_cloud: 4.0
+  prior_cloud: 0.5
+  lambda_hot: 6.5
+  prior_hot: 0.005
+  p_h_tidal: 0.5
+  beta_cloud: 1.75
+  n_sweeps_cloud: 20
+  beta_hot: 0.125
+  n_sweeps_hot: 10
+  estep_damp: 0.5
+  outer_damp: 0.5
+  p_floor: 0.01
+
+convergence:
+  max_iter: 1
+  min_iter: 1
+  cloud_frac_tol: 1.0e-3
+  p_valid_tol: 1.0e-3
+  patience: 2
+
+solver:
+  tol: 1.0e-2
+  pcg_max_iter: 25
+  precondition: true

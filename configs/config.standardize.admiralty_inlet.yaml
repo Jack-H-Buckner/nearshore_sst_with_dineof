@@ -1,0 +1,118 @@
+# Standardize the composite for eDINEOF: remove a per-pixel seasonal cycle, divide by a robust
+# per-pixel scale.
+#
+#   python prototypes/DINEOF/src/standardize.py \
+#       --config prototypes/DINEOF/configs/config.standardize.admiralty_inlet.yaml
+#   ... --dry-run        # fit and print the per-term summary, write nothing
+#
+# Every key outside `carry` is validated two levels deep; an unknown key is an error, not a
+# silent default. Relative paths resolve against prototypes/DINEOF.
+
+data:
+  aoi: admiralty_inlet
+  cube: data/datacube/admiralty_inlet_composite_validation.zarr       # source, read-only
+  out: data/datacube/admiralty_inlet_standardized.zarr     # destination
+  watervar: landcover_water
+  channel: sst_composite
+  channel_msk: sst_msk_composite
+  validation_msk: validation_msk
+
+# ------------------------------------------------------------------ seasonal
+seasonal:
+  # Harmonics in the per-pixel cycle. 1 is the right default HERE and the evidence is measured:
+  # the residual robust SD is 1.023 K at H=1, 0.990 at H=2, 0.982 at H=3. The second harmonic
+  # buys 3% of the residual for two more parameters per pixel, and every parameter is one fewer
+  # degree of freedom at the coastal-margin pixels where observations are already thinnest.
+  n_harmonics: 1
+
+  period_days: 365.25
+
+  # Minimum observations for a pixel to get its OWN cycle. Below this it takes the regional
+  # seasonal shape with only its mean level fitted (FIT_MEAN_ONLY). Median coverage here is 82
+  # observations per pixel and 96.3% of pixels have at least 30, so this only catches the
+  # coastal margin.
+  min_dates: 10
+
+  # THE GUARD THAT MATTERS, and the only one that catches the dangerous case. A pixel observed
+  # in one season only has plenty of dates -- it passes min_dates easily -- but its cos/sin
+  # columns are nearly collinear with the intercept, so the fit is free to invent an enormous
+  # amplitude in the seasons it never saw and extrapolate it back. Rejecting on the condition
+  # number of X'WX sends that pixel to the regional shape instead. 99.1% of pixels here clear
+  # cond <= 100 comfortably; the ones that do not are exactly the ones that should not be
+  # trusted with their own cycle.
+  max_cond: 100.0
+
+# ------------------------------------------------------------------ scale
+scale:
+  # mad = 1.4826 * median absolute deviation of the seasonal residual, per pixel.
+  # none = divide by 1 (a covariance EOF downstream rather than a correlation one). Worth
+  # running once to see what the normalization is actually buying.
+  #
+  # ROBUST, because the upstream filter does not catch everything: 2.48% of the standardized
+  # values exceed |z| = 3 and the largest is 10.4. An ordinary standard deviation would inflate
+  # to accommodate those and then fail to make them visible.
+  #
+  # PER-PIXEL, because the residual scale genuinely varies -- 0.60 K in the deep tidally-mixed
+  # strait against 1.68 K in the shallow inner bays, a factor of 2.8 in sd and 7.8 in variance.
+  # Without this the noisy shallow pixels dominate every leading mode.
+  estimator: mad
+
+  # Minimum scale, in K. A safety net rather than a load-bearing parameter here: the smallest
+  # measured per-pixel scale is 0.301 K and the 5th percentile is 0.601, so this touches very
+  # few pixels. It exists for the pathological case -- a pixel whose handful of residuals
+  # happen to be near-identical would otherwise get a scale near 0 and z-scores in the
+  # thousands, and would then dominate the first EOF on its own.
+  floor: 0.5
+
+  # Multiply the MAD by sqrt(n / (n - P)). Fitting P parameters to n points removes P degrees
+  # of freedom and biases the residual scale LOW by sqrt(1 - P/n): 4% at a pixel with 36
+  # observations, 16% near min_dates. Those are the coastal-margin pixels, so without this
+  # correction the thinnest-sampled part of the domain gets systematically inflated z-scores --
+  # which would then look like real anomalies to everything downstream.
+  dof_correction: true
+
+  # What a pixel uses when its own scale is unusable (no full fit, or a non-finite MAD).
+  # median = the domain median scale; floor = the value above.
+  fallback: median
+
+# ------------------------------------------------------------------ carry
+# Channels copied from the source cube unchanged. sst_composite is carried so the round-trip
+# (z * sd + seasonal == sst_composite at observed entries) is checkable from this cube alone,
+# and sst_composite_src so the next stage can still identify the reference-only dates.
+carry:
+  - landcover_water
+  - sst_composite
+  - sst_composite_src
+  - sst_composite_n
+  - depth_cudem
+  - elevation_cudem
+
+# ------------------------------------------------------------------ output
+output:
+  chunks: {time: 64, y: 128, x: 128}
+  compression: {codec: zstd, level: 5, shuffle: shuffle}
+  report: standardize_report.csv            # one row per seasonal term
+
+  write_figures: true
+  fig_dir: figures/standardize              # figures land in <fig_dir>/<aoi>/
+
+  # THE "are these fits reasonable" FIGURE. Eight maps: mean, amplitude, peak day-of-year on a
+  # cyclic scale, cos1, sin1, observation count, residual SD, and amplitude/SE. 55k pixels are
+  # fitted independently with no spatial prior, so nothing in the method forces these maps to
+  # be smooth -- which is exactly why they are worth looking at.
+  figure_coefficients: true
+
+  # Where the three-tier ladder fell back, and the surviving outliers.
+  figure_fit_quality: true
+
+  # Warn if roughness/SE exceeds this on any term.
+  #
+  # The noisiness test, as a number. Roughness is the median disagreement between neighbouring
+  # pixels; SE is each pixel's own sampling uncertainty. Well below 1 means independently
+  # fitted neighbours agree far better than their uncertainties require, which can only happen
+  # if they are tracking real structure. Measured 0.16-0.20 on this AoI, and a 3x3 smooth would
+  # move the amplitude by 17% of one SE -- which is why this pipeline does NO spatial
+  # regularization. Near or above 1 on a new AoI means that conclusion does not transfer.
+  roughness_warn: 0.5
+
+  figure_dpi: 130

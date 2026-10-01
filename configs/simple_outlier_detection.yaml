@@ -1,0 +1,100 @@
+# Parameters for src/simple_outlier_detection.py -- single-pass cloud / warm-anomaly detection.
+#
+# The first pass of outlier_detection.py with no outer loop: the MODIS covariate stays the
+# spatial mean, so there is no `analysis` section, no damping and no convergence test.
+#
+#   python prototypes/cloud_mixture_model/src/simple_outlier_detection.py \
+#       --config prototypes/cloud_mixture_model/configs/simple_outlier_detection.yaml
+#
+# Every key is validated: an unknown key is an error, not a silent default.
+# Relative paths resolve against prototypes/cloud_mixture_model.
+
+data:
+  cube: data/unfiltered/admiralty_inlet.zarr
+  var: lst_sst                 # target sensor channel to screen
+  validvar: lst_valid           # sensor QC; null disables. ECOSTRESS: eco_valid_v002
+  cloudvar: lst_cloud          # sensor cloud mask; null disables. ECOSTRESS: eco_cloud_v002
+  ref_var: modis_sst_aqua       # coarse reference for the covariate
+  landvar: landcover_water
+  depthvar: depth_cudem
+  tidal_depth_m: 3.0            # depth < this -> tidal pixel, uses p_h_tidal as warm prior
+  dates: []                     # [] = every acquisition of `var` with >= min_pixels water pixels
+  min_pixels: 64
+
+output:
+  dir: outputs/simple_outlier_detection
+  fig_dir: figures/simple_outlier_detection
+  write_netcdf: true
+  write_figures: true
+
+# Robust MODIS composite around the acquisition date.
+#
+# window_days is the coverage/smearing trade-off. Over the 56 Landsat acquisitions in this
+# cube, the fraction with under 5% MODIS cover on water goes 25 (+/-1 day) -> 12 (+/-3) ->
+# 6 (+/-4) -> 3 (+/-5) -> 2 (+/-7). The cost is small because the composite is a median:
+# against +/-1 day, +/-4 shifts the covariate by 0.000 K at the median and 0.295 K at p90 with
+# no systematic bias, versus a clear.sd of 0.75. +/-5 costs 0.027 / 0.358, +/-7 costs
+# 0.087 / 0.430 -- widen further only if dates are still being lost to min_cover.
+reference:
+  window_days: 4                # +/- days
+  qc_var: null                  # optional QC channel; pixels with qc > qc_max are dropped
+  qc_max: 1
+  quantile: 0.5
+  min_obs: 1
+  min_cover: 0.05               # fraction of water pixels needing reference data. Below this
+                                # the SPDE returns covariate.init_prior over most of the scene
+                                # and `center` compares the target to a constant, not to MODIS,
+                                # so the image is ref-flagged instead of offset-flagged.
+
+# One-off SPDE smoothing of the composite -> the covariate, i.e. the spatial mean.
+covariate:
+  init_prior: 285.0
+  init_range_px: 200.0
+  init_marg_sd: 0.1
+  init_obs_error: 0.5
+  alpha: 2                      # 1 = membrane, 2 = thin plate
+
+# Clear-sky scale of the residual (y - covariate - center).
+clear:
+  sd: 0.75                      # null -> robust sd of the residual, floored at sd_floor
+  sd_floor: 0.71                # K
+
+# Sensor QC as a per-pixel cloud prior.
+#
+# Landsat keeps SST values on pixels it flags (lst_cloud == 1 / lst_valid == 0) and those run
+# ~2-4 K cold against MODIS; ECOSTRESS instead drops them, leaving a NaN gap. Both get
+# prior_cloud: a gap has no likelihood term, so the prior IS its unary, and the Ising sweeps
+# carry that evidence to its neighbours. Evidence still decides -- a flagged pixel that reads
+# warm can come back clear.
+qc:
+  enabled: true
+  prior_cloud: 0.9              # on QC-flagged pixels AND on missing (NaN) water pixels
+  nodata_prior: 0.9            # prior for gaps the cloud channel calls NOT cloud (no-data /
+                                # swath edge). null -> they get prior_cloud like any other gap.
+
+# Whole-image QC on the sensor offset (robust centre of y - covariate), in Kelvin.
+offset:
+  lower: -2.0                   # flag when center < this; null disables this side
+  upper: 2.0                    # flag when center > this; null disables this side
+
+# Two-sided mixture (cold cloud / warm anomaly / clear) and its mean-field E-steps.
+mixture:
+  lambda_cloud: 4.0             # mean cold depression of cloud
+  min_dev_cold: 0.75
+  prior_cloud: 0.5              # baseline, where sensor QC has no verdict
+  lambda_hot: 6.5               # mean warm excess
+  min_dev_hot: 2.0
+  prior_hot: 0.001              # warm prior off the tidal zone
+  p_h_tidal: 0.5                # warm prior on the tidal zone
+  beta_cloud: 1.75
+  n_sweeps_cloud: 20            # also a range: evidence travels 1 px per sweep
+  beta_hot: 0.125
+  n_sweeps_hot: 10
+  estep_damp: 0.5               # damping inside the mean-field sweeps
+  p_floor: 0.01                 # lower clip on p_valid
+
+# PCG solver for the covariate SPDE system.
+solver:
+  tol: 1.0e-2                   # relative residual ||r|| / ||b||
+  pcg_max_iter: 25
+  precondition: true

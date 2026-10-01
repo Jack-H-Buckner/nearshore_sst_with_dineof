@@ -1,0 +1,15 @@
+{
+  "n_common_points": 30816,
+  "rmse_z_iter": 1.1980569315143947,
+  "rmse_K_iter": 1.0791835792701894,
+  "k_iter": 4,
+  "t_c_iter": 11.0,
+  "rmse_z_modis": 1.0198761242620977,
+  "rmse_K_modis": 1.0200761173397361,
+  "k_modis": 15,
+  "t_c_modis": 0.0,
+  "own_rmse_point_iter": 1.3019540399740708,
+  "own_rmse_day_iter": 1.656931212379423,
+  "own_rmse_point_modis": 0.5551641381085973,
+  "own_rmse_day_modis": 0.9768558207293456
+}

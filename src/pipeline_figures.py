@@ -1,0 +1,326 @@
+"""Figures for the end-to-end pipeline, drawn from its output cube and reports alone.
+
+  eofs.png, eofs_point.png
+                     one row per mode: the spatial EOF on the map, and its loadings against
+                     time -- full-data sigma*V and, for the smooth field, MODIS-only. Ticks mark
+                     MODIS days, shading the days no MODIS reached (smooth = climatology).
+  cv_curves.png      the coarse CV search: point- and day-holdout RMSE against k, per T_c.
+  cloud_filter_<id>.png
+                     per pixel: share of observations removed and verdict flips across the
+                     loop; per scene: the offset against the smooth field, with the band.
+  offsets_<id>.png   the offset fit on MODIS-footprint pairs: within-scene anomalies of the
+                     sensor's footprint median against MODIS (outliers marked), with the OLS,
+                     RMA and 1:1 lines; and the per-scene offset against overpass hour.
+  flag_changes.png   pixels newly flagged / restored at each loop iteration.
+  fields_<n>.png     per day: composite input | filled | smooth | filled - smooth.
+
+Re-run without the pipeline:
+
+    python src/pipeline_figures.py --cube data/pipeline/admiralty_inlet_pipeline.zarr
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+import yaml
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import iterative_filter  # noqa: F401  (bridges seasonal_smoothing for the imports below)
+import iterative_diagnostics as ID
+import plotting
+from cube_figures import GRID, INK, INK_MUTED, INK_SECONDARY, SURFACE
+
+log = logging.getLogger("pipeline_figures")
+
+MODIS_LINE = "#2a78d6"
+FULL_LINE = INK_MUTED
+
+
+def _style(ax) -> None:
+    ID._style(ax)
+
+
+def eof_figure(ds: xr.Dataset, suffix: str, out: Path, dpi: int) -> None:
+    """Spatial modes beside their loadings, one row per mode."""
+    U = ds[f"eof_U{suffix}"].values
+    sigma = ds[f"eof_sigma{suffix}"].values
+    full = ds[f"loadings_full{suffix}"].values
+    modis = ds["loadings_modis"].values if (suffix == "" and "loadings_modis" in ds) else None
+    status = ds["smooth_loading_status"].values if "smooth_loading_status" in ds else None
+    mpx = ds["smooth_modis_px"].values if "smooth_modis_px" in ds else None
+    water = plotting.water_mask(ds)
+    extent = plotting.extent_km(ds)
+    t = pd.to_datetime(ds["time"].values)
+    k = U.shape[0]
+    var = sigma ** 2 / max(float((sigma ** 2).sum()), 1e-300)
+
+    fig = plt.figure(figsize=(15, 3.1 * k + 0.8), dpi=dpi, layout="constrained")
+    gs = fig.add_gridspec(k, 2, width_ratios=[1, 3.2])
+    cmap = plt.get_cmap("RdBu_r").copy()
+    cmap.set_bad(alpha=0.0)
+    for i in range(k):
+        ax = fig.add_subplot(gs[i, 0])
+        lim = float(np.nanpercentile(np.abs(U[i][water]), 99)) if np.isfinite(U[i][water]).any() \
+            else 1.0
+        im = plotting.panel(ax, U[i], water, vmin=-lim, vmax=lim, extent=extent, cmap=cmap)
+        ax.set_title(f"EOF {i + 1}: {var[i]:.0%} of retained variance", fontsize=8, color=INK)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(im, ax=ax, shrink=0.8).ax.tick_params(labelsize=6)
+
+        ax = fig.add_subplot(gs[i, 1])
+        if status is not None:
+            for j in np.flatnonzero(status == 2):
+                ax.axvspan(t[j] - pd.Timedelta(hours=12), t[j] + pd.Timedelta(hours=12),
+                           color=GRID, alpha=0.9, linewidth=0, zorder=0)
+        ax.plot(t, full[i], color=FULL_LINE, linewidth=2, label="full data (sigma * V)")
+        if modis is not None:
+            ax.plot(t, modis[i], color=MODIS_LINE, linewidth=2,
+                    label="MODIS only (smooth field)")
+        _style(ax)
+        if mpx is not None:
+            md = t[mpx > 0]
+            ax.plot(md, np.full(md.size, ax.get_ylim()[0]), "|", color=INK_SECONDARY,
+                    markersize=6, label="MODIS day")
+        ax.set_ylabel(f"loading, mode {i + 1}", fontsize=8, color=INK_SECONDARY)
+        if i == 0:
+            ax.legend(fontsize=7, frameon=False, ncol=3, loc="upper right")
+    a = ds[f"eof_U{suffix}"].attrs
+    title = (f"EOFs of the {'point-CV' if suffix else 'smooth-field'} fit: k={a.get('k')}, "
+             f"T_c={a.get('cutoff_days')} d (standardized units)")
+    if status is not None and suffix == "":
+        title += f".  Shaded: {int((status == 2).sum())} days no MODIS reached"
+    fig.suptitle(title, fontsize=9, color=INK, ha="left", x=0.01)
+    plotting.save(fig, out)
+
+
+def cv_figure(curve: pd.DataFrame, fit: dict, out: Path, dpi: int) -> None:
+    """Point- and day-holdout RMSE against k, one line per T_c (sequential by T_c)."""
+    tcs = sorted(curve["t_c"].unique())
+    cmap = plt.get_cmap("viridis")
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2), dpi=dpi, layout="constrained")
+    for ax, col, which in ((axes[0], "rmse_point", "point"), (axes[1], "rmse_day", "day")):
+        for i, tc in enumerate(tcs):
+            g = curve[curve["t_c"] == tc].sort_values("k")
+            ax.plot(g["k"], g[col], "o-", color=cmap(i / max(len(tcs) - 1, 1)), linewidth=2,
+                    markersize=4, label=f"T_c={tc:g} d")
+        kk, tt = fit.get(f"k_{which}"), fit.get(f"tc_{which}")
+        sel = curve[(curve["k"] == kk) & (np.isclose(curve["t_c"], tt))]
+        if len(sel):
+            ax.plot(sel["k"], sel[col], "o", markersize=12, markerfacecolor="none",
+                    markeredgecolor=INK, markeredgewidth=1.6, label="selected")
+        _style(ax)
+        ax.set_xscale("log")
+        ax.set_xlabel("k (modes)", fontsize=8)
+        ax.set_ylabel("RMSE (standardized units)", fontsize=8)
+        ax.set_title(f"{which}-holdout CV" + (f": k={kk}, T_c={tt:g} d" if kk else ""),
+                     fontsize=9, color=INK)
+    axes[1].legend(fontsize=7, frameon=False)
+    plotting.save(fig, out)
+
+
+def cloud_filter_figure(ds: xr.Dataset, sid: str, sst: str, label: str, band, out: Path,
+                        dpi: int) -> None:
+    water = plotting.water_mask(ds)
+    extent = plotting.extent_km(ds)
+    raw = ds[sst].values
+    keep = ds[f"{sid}_keep"].values.astype(bool)
+    bits = ds[f"{sid}_keep_history"].values
+    n_iter = int(ds[f"{sid}_keep_history"].attrs["n_iterations"])
+    obs = np.isfinite(raw) & water[None]
+    n = obs.sum(axis=0)
+    rem = (obs & ~keep).sum(axis=0)
+    flips = np.zeros(water.shape)
+    for i in range(1, n_iter + 1):
+        flips += (obs & (ID.kept_at(bits, i) != ID.kept_at(bits, i - 1))).sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        fr = np.where(n > 0, rem / n, np.nan)
+        fl = np.where(n > 0, flips / n, np.nan)
+
+    fig = plt.figure(figsize=(15, 8.2), dpi=dpi, layout="constrained")
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.35, 1])
+    for c, (arr, cm, hi, title) in enumerate((
+            (fr, "Blues", 1.0, "share of observations removed"),
+            (fl, "Purples", max(float(np.nanpercentile(fl, 99)), 0.05)
+             if np.isfinite(fl).any() else 1.0, "verdict flips per observation across the loop"))):
+        ax = fig.add_subplot(gs[0, c])
+        cmap = plt.get_cmap(cm).copy()
+        cmap.set_bad(alpha=0.0)
+        im = plotting.panel(ax, arr, water, vmin=0, vmax=hi, extent=extent, cmap=cmap)
+        ax.set_title(title, fontsize=9, color=INK)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(im, ax=ax, shrink=0.85).ax.tick_params(labelsize=6)
+
+    ax = fig.add_subplot(gs[1, :])
+    t = pd.to_datetime(ds["time"].values)
+    c = ds[f"{sid}_center"].values
+    have = np.isfinite(c)
+    kept_scene = keep.reshape(keep.shape[0], -1).any(axis=1)
+    lo, hi = band
+    if lo is not None and hi is not None:
+        ax.axhspan(lo, hi, color=GRID, alpha=0.6, zorder=0, label="accepted band")
+    ax.scatter(t[have & kept_scene], c[have & kept_scene], s=22, color=MODIS_LINE,
+               edgecolor=SURFACE, linewidth=0.6, label="scene kept", zorder=3)
+    ax.scatter(t[have & ~kept_scene], c[have & ~kept_scene], s=30, marker="X",
+               color=plotting.FAIL_COLOR, edgecolor=SURFACE, linewidth=0.6,
+               label="scene dropped", zorder=3)
+    _style(ax)
+    ax.set_ylabel("scene offset vs smooth field [K]", fontsize=8)
+    ax.legend(fontsize=7, frameon=False, ncol=3, loc="upper left")
+    tot = max(int(obs.sum()), 1)
+    fig.suptitle(f"{label}: cloud filter. {int(have.sum())} scenes, {int(kept_scene[have].sum())}"
+                 f" kept; {int((obs & ~keep).sum()) / tot:.1%} of {tot:,} observed px removed",
+                 fontsize=9, color=INK, ha="left", x=0.01)
+    plotting.save(fig, out)
+
+
+def offsets_figure(pairs: pd.DataFrame, scenes: pd.DataFrame, row: pd.Series, label: str,
+                   out: Path, dpi: int) -> None:
+    """Footprint-pair anomalies (left) and per-scene offset vs overpass hour (right)."""
+    kept = pairs["kept"].astype(bool)
+    mx = pairs[kept].groupby("t")["modis"].mean()
+    my = pairs[kept].groupby("t")["sensor"].mean()
+    xa = pairs["modis"] - pairs["t"].map(mx)
+    ya = pairs["sensor"] - pairs["t"].map(my)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=dpi, layout="constrained")
+    ax = axes[0]
+    ax.scatter(xa[kept], ya[kept], s=9, color=MODIS_LINE, alpha=0.55, edgecolor="none",
+               label=f"kept ({int(kept.sum()):,})")
+    if (~kept).any():
+        ax.scatter(xa[~kept], ya[~kept], s=16, marker="x", color="#eb6834", linewidth=0.9,
+                   label=f"removed as outliers ({int((~kept).sum()):,})")
+    lim = float(np.nanpercentile(np.abs(np.r_[xa, ya]), 99.5)) if len(xa) else 1.0
+    xs = np.array([-lim, lim])
+    ax.plot(xs, xs, color=INK_MUTED, linewidth=1, linestyle="--", label="1:1")
+    for key, ls, name in (("slope_ols", "-", "OLS"), ("slope_rma", ":", "RMA")):
+        b = float(row.get(key, np.nan))
+        if np.isfinite(b):
+            ax.plot(xs, b * xs, color=INK, linewidth=1.6, linestyle=ls, label=f"{name} {b:.3f}")
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    _style(ax)
+    ax.set_xlabel("MODIS footprint, within-scene anomaly [K]", fontsize=8)
+    ax.set_ylabel(f"{label} footprint median, within-scene anomaly [K]", fontsize=8)
+    applied = float(row.get("slope_applied", 1.0))
+    ax.set_title(f"{row.get('aggregate', 'footprint')} pairs; slope applied {applied:.3f}"
+                 f" ({row.get('slope_estimator', 'none')}); clipping "
+                 f"{int(row.get('clip_rounds', 0))} rounds"
+                 + ("" if bool(row.get("clip_converged", True)) else ", NOT converged"),
+                 fontsize=8, color=INK)
+    ax.legend(fontsize=7, frameon=False, loc="upper left")
+
+    ax = axes[1]
+    if len(scenes):
+        ax.scatter(scenes["hour"], scenes["delta"], s=22, color=MODIS_LINE, edgecolor=SURFACE,
+                   linewidth=0.6, label="scene offset (median over its footprints)")
+        o = scenes.sort_values("hour")
+        if "fitted" in o:
+            ax.plot(o["hour"], o["fitted"], color=INK, linewidth=1.6, label="fitted a(hour)")
+    _style(ax)
+    ax.set_xlabel("overpass hour [UTC]", fontsize=8)
+    ax.set_ylabel("offset at the pivot temperature [K]", fontsize=8)
+    ax.set_title(f"K={int(row.get('K', 0))}, mean offset {float(row.get('offset_mean', np.nan)):+.3f}"
+                 f" K over {int(row.get('n_scenes', 0))} scenes", fontsize=8, color=INK)
+    ax.legend(fontsize=7, frameon=False)
+    fig.suptitle(f"{label}: offset against MODIS", fontsize=9, color=INK, ha="left", x=0.01)
+    plotting.save(fig, out)
+
+
+def diagnostics_adapter(ds: xr.Dataset, cfg: dict, scenes: pd.DataFrame) -> dict:
+    """The `D` dict iterative_diagnostics' figure functions read, from a pipeline cube."""
+    water = plotting.water_mask(ds)
+    sensors = {}
+    for sid, s in cfg["sensors"].items():
+        raw = ds[s["sst"]].values
+        js = np.sort(scenes.loc[scenes["sensor"] == sid, "t"].to_numpy())
+        sensors[sid] = dict(label=s.get("label") or sid, raw=raw, scenes=js,
+                            bits=ds[f"{sid}_keep_history"].values,
+                            n_iter=int(ds[f"{sid}_keep_history"].attrs["n_iterations"]))
+    fields = dict(filled=ds["sst_filled"].values, base=ds["sst_smooth"].values,
+                  comp=ds["sst_composite"].values, src=ds["sst_composite_src"].values,
+                  order=ds["sst_composite_src"].attrs["flag_meanings"].split(),
+                  coarsen=1,
+                  status=(ds["smooth_loading_status"].values
+                          if "smooth_loading_status" in ds else None))
+    return dict(water=water, times=ds["time"].values, extent=plotting.extent_km(ds),
+                sensors=sensors, fields=fields,
+                source=ds["sst_smooth"].attrs.get("baseline_source", "modis"))
+
+
+def render(cube: Path, fig_dir: Path, rep_dir: Path | None = None, *, dpi: int = 130,
+           n_field_days: int = 3, field_dates=()) -> None:
+    cube = Path(cube)
+    rep_dir = Path(rep_dir) if rep_dir is not None else None
+    ds = xr.open_zarr(cube)
+    cfg = yaml.safe_load(ds.attrs["pipeline_config"])
+    fit = json.loads(ds.attrs["pipeline_fit"])
+    fig_dir = Path(fig_dir)
+
+    eof_figure(ds, "", fig_dir / "eofs.png", dpi)
+    eof_figure(ds, "_point", fig_dir / "eofs_point.png", dpi)
+
+    if rep_dir is not None and (rep_dir / "cv_curve.csv").exists():
+        cv_figure(pd.read_csv(rep_dir / "cv_curve.csv"),
+                  {"k_point": fit["k_point"], "tc_point": fit["tc_point"],
+                   "k_day": fit["k_day"], "tc_day": fit["tc_day"]},
+                  fig_dir / "cv_curves.png", dpi)
+
+    band = (cfg.get("filter", {}).get("offset_lower", -2.0),
+            cfg.get("filter", {}).get("offset_upper", 4.0))
+    for sid, s in cfg["sensors"].items():
+        cloud_filter_figure(ds, sid, s["sst"], s.get("label") or sid, band,
+                            fig_dir / f"cloud_filter_{sid}.png", dpi)
+
+    if rep_dir is not None and (rep_dir / "footprint_pairs_final.csv").exists():
+        pairs = pd.read_csv(rep_dir / "footprint_pairs_final.csv")
+        scenes = pd.read_csv(rep_dir / "matchups_final.csv")
+        rep = pd.read_csv(rep_dir / "offsets_final.csv").set_index("member")
+        for sid, s in cfg["sensors"].items():
+            if sid in rep.index:
+                offsets_figure(pairs[pairs["sensor_id"] == sid],
+                               scenes[scenes["member"] == sid], rep.loc[sid],
+                               s.get("label") or sid, fig_dir / f"offsets_{sid}.png", dpi)
+
+    if rep_dir is not None and (rep_dir / "scenes.csv").exists():
+        D = diagnostics_adapter(ds, cfg, pd.read_csv(rep_dir / "scenes.csv"))
+        ID.flag_changes_figure(D, fig_dir / "flag_changes.png", dpi)
+        days = ID.pick_field_days(D, n_field_days, list(field_dates))
+        for page, i in enumerate(range(0, len(days), 6)):
+            ID.fields_figure(D, days[i:i + 6], fig_dir / f"fields_{page + 1}.png", dpi)
+    else:
+        log.info("no reports directory; flag_changes and fields figures skipped")
+    log.info("figures in %s", fig_dir)
+
+
+def main(argv=None) -> None:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--cube", type=Path, required=True)
+    p.add_argument("--fig-dir", type=Path, default=None,
+                   help="default: figures<suffix>/ next to the cube")
+    p.add_argument("--reports", type=Path, default=None,
+                   help="default: reports<suffix>/ next to the cube")
+    p.add_argument("--field-dates", nargs="*", default=[])
+    p.add_argument("--dpi", type=int, default=130)
+    args = p.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    stem = args.cube.stem
+    sfx = stem.split("_pipeline", 1)[1] if "_pipeline" in stem else ""
+    fig_dir = args.fig_dir or args.cube.parent / f"figures{sfx}"
+    rep_dir = args.reports or args.cube.parent / f"reports{sfx}"
+    render(args.cube, fig_dir, rep_dir, dpi=args.dpi, field_dates=args.field_dates)
+
+
+if __name__ == "__main__":
+    main()

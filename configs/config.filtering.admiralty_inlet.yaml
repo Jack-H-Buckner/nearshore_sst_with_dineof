@@ -1,0 +1,134 @@
+# Scene filtering + visual inspection for the DINEOF prototype.
+#
+#   python prototypes/DINEOF/src/filter_images.py \
+#       --config prototypes/DINEOF/configs/config.filtering.admiralty_inlet.yaml
+#   ... --no-scenes     # contact sheets only (~30 s): the loop for sweeping a threshold
+#
+# Every key outside `sensors` is validated two levels deep; an unknown key is an error, not
+# a silent default. `sensors` is validated by validate_sensors() one level per sensor, and
+# its criteria by helpers.Criterion.from_spec, which rejects unknown keys of its own.
+# Relative paths resolve against prototypes/DINEOF.
+#
+# THE DENOMINATOR IS WATER. Every channel is masked to `landcover_water` before scoring and
+# every criterion runs nan_policy: ignore, so land leaves both the numerator and the
+# denominator. A `prop:` here always means "this fraction of the AoI's WATER pixels" --
+# 55,722 of the box's 91,809 on this AoI. Scored over the frame instead, the same scene
+# reads 0.607x lower and the threshold means something different on every AoI.
+
+data:
+  aoi: admiralty_inlet
+  # The cube is built by the cloud_mixture_model prototype's config; DINEOF only reads it.
+  cube: ../cloud_mixture_model/data/datacube/admiralty_inlet.zarr
+  watervar: landcover_water          # > 0.5 is water
+  sensors: [eco, lst]                # which blocks below to run, and in what order
+
+output:
+  fig_dir: figures/filtering         # figures land in <fig_dir>/<aoi>/
+  write_scenes: true                 # one SST | valid | cloud row per acquisition
+  write_contact_sheet: true          # one sheet per sensor
+  write_report: false                # report_<sensor>.csv of the full score table
+
+plot:
+  shared_scale: true                 # one SST range per SENSOR, not per scene: the contact
+                                     # sheet exists so scenes can be compared, and per-scene
+                                     # rescaling makes an overcast 8 degC scene and a clear
+                                     # 18 degC scene render identically. false is for
+                                     # reading structure inside one marginal scene.
+  pct_lo: 1.0                        # percentiles for the shared range, taken over
+  pct_hi: 99.0                       # sensor-VALID water only -- Landsat's raw 1st
+                                     # percentile is -33 degC, which is a cloud top
+  ncols: 8                           # contact-sheet columns
+  scene_dpi: 130
+  sheet_dpi: 150
+  sort_by: leading                   # leading | date -- contact-sheet ordering
+  descending: true                   # highest leading fraction first, so the pass/fail
+                                     # boundary is one visible seam
+
+# ------------------------------------------------------------------ per-sensor
+#
+# UNITS: `<pre>_cloud` rasters are FRACTIONS 0..1; `<pre>_cloud_cover_hrrr` is PERCENT
+# 0..100. Write "<0.5" for the former and "<40" for the latter.
+#
+# `label` is REQUIRED and must be unique. It names the report column and the figure
+# annotation, so keep it short enough to read on a 1.85-inch contact-sheet panel. It may not
+# be "valid" or start with "pass: " -- evaluate_criteria writes those columns itself and
+# would overwrite the fraction with the verdict.
+#
+# The FIRST criterion is the LEADING one: it sorts the contact sheet. Put the one you are
+# currently tuning first.
+#
+# `fill: <x>` (a key this prototype handles, not one helpers knows) substitutes a value for
+# water pixels the channel does not define, putting them back in the denominator. Without it
+# the denominator is the channel's own footprint rather than the AoI water.
+
+sensors:
+
+  eco:
+    label: ECOSTRESS v002
+    short: ECO
+    sst: eco_sst_v002
+    valid: eco_valid_v002            # water_polarity_status "corrected"; 1 = usable water px
+    cloud: eco_cloud_v002
+    hour: eco_hour_v002
+    min_pixels: 64                   # finite water px for a day to count as an acquisition
+    require: all
+    default_prop: 0.5
+    criteria:
+      - {channel: eco_valid_v002, value: 1, prop: 0.35, nan_policy: ignore,
+         label: "valid>=0.35"}
+      # eco_valid_v002 is gated on QC bits ONLY -- ECOSTRESS's own cloud raster over-masks
+      # genuinely cold water, so the pipeline deliberately does not apply it (see
+      # docs/plan-cloud-filtering-ecostress.md). Cloud contamination therefore survives into
+      # the cube and has to be caught here.
+      # fill: 1.0 == "undefined cloud is cloud", matching the assembler's own
+      # np.nan_to_num(c, nan=1.0). The raster covers 269 dates; the SST covers 156.
+      - {channel: eco_cloud_v002, value: "<0.5", prop: 0.50, nan_policy: ignore, fill: 1.0,
+         label: "clear<0.5"}
+      # NO HRRR CRITERION -- dropped deliberately, see the note at the foot of this file.
+      # A (time,) flag, broadcast onto the grid so it can be scored at all; its fraction is
+      # then exactly 0 or 1 and prop: 0.99 reads as "this flag must hold".
+      # 0 = ok, 1 = displaced (corrected); 2..5 are suspect/unstable/unrecoverable.
+      - {channel: eco_georef_flag, value: [0, 1], prop: 0.99, nan_policy: ignore,
+         label: "georef ok"}
+
+  lst:
+    label: Landsat
+    short: LS
+    sst: lst_sst
+    valid: lst_valid                 # water_polarity_status "ok"
+    cloud: lst_cloud
+    hour: lst_hour
+    min_pixels: 64
+    require: all
+    default_prop: 0.5
+    criteria:
+      # Stricter than ECOSTRESS on purpose: lst_valid ALREADY has the cloud raster and a
+      # 1 km buffer applied (use_cloud=True), so a Landsat scene that survives the same
+      # nominal threshold is genuinely cleaner -- and one that fails `valid` here has failed
+      # a test ECOSTRESS was never given.
+      - {channel: lst_valid, value: 1, prop: 0.60, nan_policy: ignore,
+         label: "valid>=0.60"}
+      - {channel: lst_cloud, value: "<0.5", prop: 0.70, nan_policy: ignore, fill: 1.0,
+         label: "clear<0.5"}
+      # NO HRRR CRITERION -- dropped deliberately, see the note at the foot of this file.
+
+# ------------------------------------------------------------------ why no HRRR criterion
+#
+# `<pre>_cloud_cover_hrrr` was tried as a third criterion on both sensors and removed. It is
+# a FORECAST at the overpass hour, not a measurement of the scene, and it was overruling the
+# sensors' own rasters:
+#
+#   * At <40% @ prop 0.50 it vetoed 19 of the 68 ECOSTRESS acquisitions that pass every other
+#     criterion -- 28% of the usable stack discarded on a model field.
+#   * 2025-03-07 is the clearest case: 97% of the AoI water valid and 98.6% clear on
+#     eco_cloud_v002, failed on HRRR at 0.243 against a 0.25 threshold.
+#   * Sweeping the cut (20/40/60/80/90%) against the proportion (0.05..0.50) never found a
+#     clean setting: the fraction is densely populated at EVERY threshold, so each candidate
+#     decided some scene by a margin of ~0.003 -- a rounding error, not weather.
+#   * On Landsat it vetoed nothing at any permissive setting, because lst_valid already has
+#     the real cloud raster and a 1 km buffer applied. It had nothing left to contribute.
+#
+# The sensors' own per-pixel cloud rasters and QC gates measure the scene that was actually
+# acquired; a gridded forecast of the surrounding hour does not, and cannot be thresholded
+# here without discarding good data. If a met prior is wanted later it belongs in the
+# mixture model as a soft prior, not as a hard gate in front of DINEOF.

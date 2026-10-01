@@ -1,0 +1,222 @@
+# Offset-correct every sensor against MODIS and composite them into the DINEOF input field.
+#
+#   python prototypes/DINEOF/src/composite.py \
+#       --config prototypes/DINEOF/configs/config.composite.admiralty_inlet.yaml
+#   ... --dry-run        # fit and print the offset table, write nothing
+#   ... --members eco    # fit a subset; the reference is always included
+#
+# Every key outside `members` and `carry` is validated two levels deep; an unknown key is an
+# error, not a silent default. Relative paths resolve against prototypes/DINEOF.
+#
+# Reads the cube build_cube.py wrote. Stage 3 fits one offset model per member against the
+# reference on the dates where both see the same water; stage 4 averages the corrected
+# channels per pixel into `sst_composite`.
+
+data:
+  aoi: admiralty_inlet
+  cube: data/datacube/admiralty_inlet_filtered.zarr      # source, read-only
+  out: data/datacube/admiralty_inlet_composite_validation.zarr      # destination
+  watervar: landcover_water
+  date: time
+
+# ------------------------------------------------------------------ reference
+# The member every other member is placed on the scale of. It gets an offset of identically
+# zero and its `<id>_adj` channel is its source channel unchanged.
+#
+# MODIS is the anchor because it is the only channel with year-round coverage (finite on 123 of
+# 365 days) and because the detector in build_cube.py already scored every ECOSTRESS and
+# Landsat scene against it -- so the two stages agree about what "no offset" means.
+#
+# Worth being explicit about what this choice costs: MODIS Aqua here is a NIGHT-TIME retrieval,
+# so the composite lands on a night-time scale and the diurnal warming fitted out of ECOSTRESS
+# below is removed rather than represented. For a DINEOF reconstruction of a coherent daily
+# field that is the right trade; if you later want the daytime field, refit with a daytime
+# anchor rather than adding a constant here.
+reference: modis
+
+# ------------------------------------------------------------------ members
+# The channels that get corrected and averaged. Each contributes `<id>_adj` (corrected SST) and
+# `<id>_offset` (the (time,) value removed), and one bit of `sst_composite_src` -- at most 8.
+#
+# Keyed by a short id, not by the source channel name: the raw names have already been through
+# two stages and `eco_sst_v002_dineof_adj` is where that ends. `var` is the link back.
+#
+# ADDING MODIS TERRA is one block here plus modis_sst_terra / modis_valid_terra /
+# modis_hour_terra in the build_cube config's `carry` list. Terra is not in the current cube --
+# it needs a re-assemble of the source cube with `platforms: [terra, aqua]`.
+members:
+  modis:
+    label: MODIS Aqua
+    var: modis_sst_aqua
+    valid: modis_valid_aqua       # null -> the variable's own finite mask is the only gate
+    hour: modis_hour_aqua
+    weight: 1.0
+    diurnal_harmonics: 0          # ignored: this is the reference
+
+  eco:
+    label: ECOSTRESS v002
+    var: eco_sst_v002_dineof      # the outlier-filtered channel, NOT the raw one
+    valid: null                   # build_cube.py already applied the pixel cut
+    hour: eco_hour_v002
+    weight: 1.0
+    # Overpasses span 0.0-23.8 UTC, so a diurnal term is genuinely identifiable here -- and
+    # genuinely needed, since the anchor is a night-time retrieval. K=1 is what the LOO gate
+    # selects; K=2 is available and is rejected (see offset.max_harmonics).
+    diurnal_harmonics: 1
+
+  lst:
+    label: Landsat
+    var: lst_sst_dineof
+    valid: null
+    hour: lst_hour
+    weight: 1.0
+    # Asked for, and refused by the cond gate: Landsat's overpasses span 18.9-19.03 UTC, eight
+    # minutes, so the K=1 design has condition number 1.1e5 and the ladder steps down to a
+    # constant. Left at 1 on purpose, as the config's way of saying "fit an hour term if the
+    # data can support one" rather than hard-coding the answer.
+    diurnal_harmonics: 1
+
+# ------------------------------------------------------------------ carry
+# EXTRA channels copied from the source cube unchanged. Each member's own `var` and `hour` are
+# written automatically and must NOT be listed here.
+carry:
+  - landcover_water               # the water mask every consumer needs
+  - depth_cudem
+  - elevation_cudem
+
+# ------------------------------------------------------------------ matchup
+# What counts as a pairing between a member and the reference. Same date, same pixel: no
+# temporal window, because a window would let real day-to-day variability leak into the fitted
+# offset, and there are enough same-day scenes here not to need one (ECOSTRESS 50, Landsat 14).
+matchup:
+  # Minimum overlapping water pixels for a scene to enter the fit. At 200, ECOSTRESS gives 50
+  # scenes and Landsat 14; the median scene contributes ~3000 px, so this only excludes slivers
+  # whose median difference would be dominated by whichever corner of the AoI happened to clear.
+  min_pixels: 200
+
+  # A scene whose median difference exceeds this is dropped from the fit and logged. A guard
+  # against a contaminated reference scene, not a tuning knob: the largest honest ECOSTRESS
+  # difference observed here is +3.59 K.
+  max_abs_delta: 8.0
+
+  # Box-average the member to this many pixels square before differencing, to compare at the
+  # reference's own support. 0 = off. 10 would be MODIS's ~1 km on this 100 m grid, and
+  # measurably tightens the within-scene spread (0.339 -> 0.241 K) without moving the offset
+  # (1.232 -> 1.238). Off by default because it does not change the answer, only the diagnostic.
+  smooth_to_reference_px: 0
+
+# ------------------------------------------------------------------ offset
+# The model removed from each member. Fitted in two levels: a robust median difference per
+# scene, then weighted least squares of those across scenes on a harmonic in overpass hour.
+offset:
+  model: diurnal                  # diurnal | constant (constant forces K=0 everywhere)
+  max_harmonics: 1                # ceiling on every member's diurnal_harmonics
+
+  # GATE 1, NUMERICAL. Reject a harmonic the overpass hours cannot identify. This is what
+  # catches Landsat: over an 8-minute span, corr(delta, hour) = -0.72 is seasonal aliasing, and
+  # a fit would happily report it as a diurnal cycle. cond = 1.1e5 there against 1.6 for
+  # ECOSTRESS, so 100 separates them by three orders of magnitude.
+  max_cond: 100.0
+
+  # GATE 2, STATISTICAL. Keep K only if it beats K-1 on leave-one-out RMSE.
+  #
+  # NOT optional decoration, and not redundant with max_cond. ECOSTRESS's hours are spread so
+  # well that cond stays between 1.6 and 3.0 for K=1, 2 AND 3 -- the ladder never fires at any
+  # K, so without this gate raising max_harmonics would silently fit five parameters to fifty
+  # noisy scene means. LOO measures: K=0 0.9400, K=1 0.9220, K=2 0.9327. K=1 wins, K=2 overfits,
+  # and the whole diurnal term buys 1.9% on a 0.92 K scatter -- real, but small enough that it
+  # deserves a gate rather than a default.
+  loo_gate: true
+
+  # How much each scene counts in the across-scene fit.
+  #
+  # variance_components: w = 1/(tau2 + sd^2/n), tau2 the BETWEEN-scene variance estimated from
+  #   the constant-model residual. Here tau2 ~ 0.86 K^2 against a within-scene variance of
+  #   ~0.004 -- a factor of 200 -- so this collapses to near-equal weights. Each scene counts
+  #   once, which is right: the scatter between scenes is real day-to-day difference, not
+  #   sampling noise that more pixels would beat down.
+  # equal:     the same answer here, without estimating tau2.
+  # n_pixels:  DIAGNOSTIC ONLY. Weighting a scene by its pixel count asserts a precision the
+  #   between-scene scatter says does not exist, and is algebraically the pooled per-pixel
+  #   regression written the long way round. It moves the ECOSTRESS constant from 1.23 to 1.03,
+  #   which is the clearest demonstration of why it is wrong; flip to it to reproduce that.
+  weights: variance_components
+
+  # ALSO FIT A SLOPE, member = a(hour) + b * reference, and divide it out. SHIPPED OFF.
+  #
+  # The option exists because a gain term is a reasonable thing to want. It defaults off
+  # because on this data it is not identifiable and the failure is silent and destructive:
+  # pooled per-scene-anomaly OLS gives b = 0.639 while the ratio of anomaly standard deviations
+  # -- the reduced-major-axis counterpart -- gives 1.124. MODIS is a ~1 km retrieval
+  # nearest-neighbour-resampled onto this 100 m grid, so its values carry resolution error and
+  # OLS is attenuated toward zero rather than measuring a real gain. Dividing by 0.639 would
+  # inflate every spatial SST gradient by 1.56x before DINEOF saw it, and the result would look
+  # like sharper fronts rather than like a bug.
+  #
+  # The true slope is somewhere in [0.64, 1.12]. Both estimates are written to offsets.csv as
+  # slope_ols and slope_rma on every run, so the evidence is there whether or not this is on.
+  slope: false
+
+  # Below this many matchup scenes, force a constant offset regardless of the gates above.
+  min_scenes: 8
+
+  # A fitted offset outside this band is a hard error, not a warning. An offset of several
+  # kelvin is contamination or extrapolation, and silently subtracting it would corrupt the
+  # whole member. Inspect matchups.csv before widening it.
+  clip: [-5.0, 5.0]
+
+# ------------------------------------------------------------------ composite
+composite:
+  # Minimum members that must see a pixel for it to appear in sst_composite.
+  #
+  # 1 is the right default and the reason is worth knowing: 84.9% of covered pixels here have
+  # exactly ONE member, 14.0% two, 1.2% three. The composite is overwhelmingly a union rather
+  # than a mean, and min_members: 2 would discard 85% of the data DINEOF has to work with.
+  min_members: 1
+
+  # Write sst_composite_src, a bitmask naming which members contributed to each pixel.
+  #
+  # The channel that makes the next stage cheap. 53 of the 185 covered dates are MODIS-only, at
+  # ~7% water coverage and 1 km support, and their footprint edges would enter DINEOF's EOF
+  # basis as if they were real structure. With the bitmask, the DINEOF step can drop or
+  # downweight those columns without re-running this stage.
+  write_source_bits: true
+
+# ------------------------------------------------------------------ output
+output:
+  chunks: {time: 64, y: 128, x: 128}        # matches the source cube's on-disk chunking
+  compression: {codec: zstd, level: 5, shuffle: shuffle}
+  offsets: offsets.csv                      # one row per member: coefficients and fit quality
+  matchups: matchups.csv                    # one row per scene: the data behind those rows
+
+  write_figures: true                       # master switch for the three below
+  fig_dir: figures/composite                # figures land in <fig_dir>/<aoi>/
+
+  # THE OFFSET MODEL's tuning instrument: per-scene difference against overpass hour, with the
+  # fitted curve AND the constant-model line drawn together so the diurnal term is judged
+  # against the scatter it sits inside rather than against a blank axis.
+  figure_offsets: true
+
+  # Member against reference, before and after correction. The cloud should translate along the
+  # 1:1 and NOT change slope -- the residual tilt is the errors-in-variables artefact discussed
+  # under offset.slope, and leaving it visible is the point.
+  figure_hexbin: true
+
+  # Water coverage per date by member, with the MODIS-only dates called out.
+  figure_coverage: true
+
+  # PER-DATE. One figure per date with composite data, into <fig_dir>/<aoi>/scenes/<date>.png:
+  # every member's corrected field side by side, then the composite they average into, then the
+  # member count. All the SST panels on ONE range so a member reading systematically warm or
+  # cool after correction is obvious -- that is the failure these are drawn to catch. The
+  # expensive one: 185 figures, ~2 min. The directory is cleared each run, so it never mixes
+  # two builds.
+  figure_scenes: true
+
+  # ALL DATES AT ONCE. One contact sheet, <fig_dir>/<aoi>/contact_composite.png, chronological
+  # and on a shared colour scale, so the whole DINEOF input sequence reads as one image: the
+  # gaps, the seasonal swing, and the dates carried by the reference alone (dashed frames).
+  figure_contact: true
+
+  figure_dpi: 130
+  figure_ncols: 8                           # contact-sheet columns
