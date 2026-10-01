@@ -126,7 +126,8 @@ SENSOR_DEFAULTS = {
 }
 
 # Scalar keys `detector` carries in addition to simple_outlier_detection's own sections.
-DETECTOR_SCALARS = {"ref_var", "depthvar", "tidal_depth_m"}
+DETECTOR_SCALARS = {"ref_var", "tidal_depth_m"}
+DETECTOR_OPTIONAL_SCALARS = {"depthvar"}   # null = no intertidal prior
 # Sections of the detector config this process owns rather than the user.
 DETECTOR_OWNED = {"data", "output", "offset"}
 
@@ -184,7 +185,7 @@ def validate_detector(cfg: dict, path: Path) -> None:
         raise ValueError(f"{path}: `detector` must be a non-empty mapping")
 
     for key, value in det.items():
-        if key in DETECTOR_SCALARS:
+        if key in DETECTOR_SCALARS or key in DETECTOR_OPTIONAL_SCALARS:
             continue
         if key in DETECTOR_OWNED:
             raise ValueError(
@@ -278,8 +279,9 @@ def validate_channels(cfg: dict, ds: xr.Dataset, path: Path) -> None:
     misspelling fails before the first acquisition is processed rather than 9 minutes in."""
     available = sorted(map(str, ds.data_vars))
     wanted = [(f"data.watervar", cfg["data"]["watervar"]),
-              ("detector.ref_var", cfg["detector"]["ref_var"]),
-              ("detector.depthvar", cfg["detector"]["depthvar"])]
+              ("detector.ref_var", cfg["detector"]["ref_var"])]
+    if cfg["detector"].get("depthvar"):
+        wanted.append(("detector.depthvar", cfg["detector"]["depthvar"]))
     for sid, s in cfg["sensors"].items():
         wanted += [(f"sensors.{sid}.{k}", s[k]) for k in ("sst", "valid", "cloud", "hour")]
     wanted += [(f"carry[{i}]", n) for i, n in enumerate(cfg["carry"])]
@@ -307,7 +309,7 @@ def detector_cfg(cfg: dict, sid: str) -> dict:
 
     dcfg["data"].update(
         cube=cfg["data"]["cube"], var=s["sst"], validvar=s["valid"], cloudvar=s["cloud"],
-        ref_var=det["ref_var"], landvar=cfg["data"]["watervar"], depthvar=det["depthvar"],
+        ref_var=det["ref_var"], landvar=cfg["data"]["watervar"], depthvar=det.get("depthvar"),
         tidal_depth_m=det["tidal_depth_m"], dates=[], min_pixels=s["min_pixels"])
 
     # Per-sensor QC nuance: ECOSTRESS gaps carry a cloud/no-data distinction, Landsat's do not.

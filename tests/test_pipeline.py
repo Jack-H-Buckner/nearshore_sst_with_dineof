@@ -305,3 +305,26 @@ def test_matchup_config_validated(tmp_path):
         with pytest.raises(ValueError, match=msg):
             P.build_config(SC.pipeline_user_config(tmp_path / "s", tmp_path / "o", **over),
                            resolve=False)
+
+
+def test_pipeline_no_depth_channel(tmp_path):
+    """Pipeline completes when the source cube has no depth channel and depthvar is null."""
+    src = tmp_path / "nodepth.zarr"
+    SC.build(src)
+    # Drop depth_cudem from the cube so no depth channel exists
+    ds = xr.open_zarr(src)
+    ds = ds.drop_vars("depth_cudem")
+    nodepth_src = tmp_path / "nodepth2.zarr"
+    ds.to_zarr(nodepth_src, mode="w")
+    cfg = P.build_config(
+        SC.pipeline_user_config(
+            nodepth_src,
+            tmp_path / "out",
+            detector={"depthvar": None},
+            data={"carry": ["landcover_water"]},
+        ),
+        resolve=False,
+    )
+    out = P.run_pipeline(cfg, tag="t", figures=False)
+    result = xr.open_zarr(out["cube"])
+    assert "sst_filled" in result

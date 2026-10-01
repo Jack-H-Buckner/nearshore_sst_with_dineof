@@ -509,7 +509,9 @@ def load_inputs(ds, date, cfg):
     """Target acquisition on water, plus the water and tidal masks."""
     d = cfg["data"]
     land = np.asarray(ds[d["landvar"]].compute() > 0.5)
-    tidal = np.asarray(ds[d["depthvar"]].compute() < d["tidal_depth_m"])
+    dv = d.get("depthvar")
+    tidal = (np.asarray(ds[dv].compute() < d["tidal_depth_m"])
+             if dv and dv in ds else np.zeros(land.shape, bool))
     da = ds[d["var"]].sel(time=date, method="nearest").compute()
     y = np.where(land, np.asarray(da, float), np.nan)
     return y, land, tidal, pd.Timestamp(da.time.values)

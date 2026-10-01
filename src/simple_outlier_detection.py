@@ -69,7 +69,7 @@ DEFAULTS = {
         "cloudvar": "lst_cloud",
         "ref_var": "modis_sst_aqua",
         "landvar": "landcover_water",
-        "depthvar": "depth_cudem",
+        "depthvar": None,          # null = no intertidal prior; set to a depth channel to enable
         "tidal_depth_m": 3.0,
         "dates": [],
         "min_pixels": 64,

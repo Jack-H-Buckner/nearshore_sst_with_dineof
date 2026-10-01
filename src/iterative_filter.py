@@ -521,8 +521,11 @@ def load_raw(cfg: dict, times: np.ndarray | None = None) -> Raw:
     sids = list(cfg["sensors"])
     ref = cfg["reference"]
     order = [ref["id"]] + sids
-    depth = np.asarray(src[cfg["detector"]["depthvar"]].compute(), float)
-    tidal = depth < float(cfg["detector"]["tidal_depth_m"])
+    dv = cfg["detector"].get("depthvar")
+    if dv and dv in src:
+        tidal = np.asarray(src[dv].compute(), float) < float(cfg["detector"]["tidal_depth_m"])
+    else:
+        tidal = np.zeros(water.shape, bool)   # no intertidal prior
 
     members = {ref["id"]: {"var": ref["var"], "valid": ref["valid"]}}
     ref_stack = C.member_stack(src, {"members": members}, ref["id"], water)
