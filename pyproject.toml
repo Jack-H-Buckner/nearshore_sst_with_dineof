@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nearshore-sst-dineof"
+version = "0.1.0"
+description = "Nearshore SST from MODIS, ECOSTRESS and Landsat: offsets, iterative DINEOF cloud filtering and gap filling, in-situ validation"
+requires-python = ">=3.11"
+# The coastal_sst_data conda environment provides these (and coastal_sst_data itself);
+# install with `pip install -e . --no-deps` inside it.
+dependencies = [
+    "numpy", "scipy", "pandas", "xarray", "zarr", "matplotlib", "pyproj", "pyyaml",
+]
+
+[project.scripts]
+nearshore-sst = "nearshore_sst.cli:main"
+
+[tool.setuptools]
+# Only the CLI shim is installed. The pipeline's modules stay in src/ (flat modules with
+# generic names) and are put on the import path by the CLI at run time, so an EDITABLE
+# install from the repository is required.
+packages = ["nearshore_sst"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

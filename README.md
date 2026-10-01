@@ -39,21 +39,47 @@ to minimize the cross validation error.
 
 ## Quick start
 
-The pipeline runs in three stages, each driven by one YAML file per region:
+Install the command line interface once, from the repository root, inside the
+`coastal_sst_data` environment:
+
+```bash
+pip install -e . --no-deps
+```
+
+This installs a `nearshore-sst` command. The pipeline runs in three stages, each driven by one
+YAML file per region:
 
 ```bash
 # 1. sensor offsets against MODIS (fixed vs fixed + slope), with diagnostics
-python src/run_region.py --config configs/region.admiralty_inlet.yaml offsets
+nearshore-sst offsets  --config configs/region.admiralty_inlet.yaml
 
 # 2. apply the offsets, run the iterative DINEOF cloud filter and the gap-filling fit
-python src/run_region.py --config configs/region.admiralty_inlet.yaml dineof
+nearshore-sst dineof   --config configs/region.admiralty_inlet.yaml
 
 # 3. validate the filled fields against in-situ water temperature
-python src/run_region.py --config configs/region.admiralty_inlet.yaml validate
+nearshore-sst validate --config configs/region.admiralty_inlet.yaml
 
 # or all three in order
-python src/run_region.py --config configs/region.admiralty_inlet.yaml all
+nearshore-sst all      --config configs/region.admiralty_inlet.yaml
 ```
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `nearshore-sst init <aoi> --source CUBE [--insitu FILE]` | Writes `configs/region.<aoi>.yaml` from the template, with those keys filled in |
+| `nearshore-sst check -c CONFIG` | Validates the config and the source cube without running anything: required channels, CRS, the dates selected, MODIS days, acquisitions per sensor, and the in-situ source. Exits with status 1 on an error |
+| `nearshore-sst offsets -c CONFIG` | Stage 1 |
+| `nearshore-sst dineof -c CONFIG` | Stage 2 (needs stage 1) |
+| `nearshore-sst validate -c CONFIG` | Stage 3 (needs stage 2) |
+| `nearshore-sst all -c CONFIG` | Stages 1–3 in order |
+| `nearshore-sst status -c CONFIG` | What each stage has produced: offsets chosen, selected DINEOF settings, CV holdout error, MSE against in situ |
+| `nearshore-sst figures -c CONFIG` | Re-draws stage 2's figures from its cube without re-running it |
+| `nearshore-sst fetch-insitu --cube CUBE --start D --end D --out FILE.nc` | Downloads IOOS in-situ temperature for the cube's footprint (`--dry-run` lists the stations) |
+
+`nearshore-sst COMMAND --help` lists a command's options. Without installing,
+`python -m nearshore_sst.cli …` (from the repo root) and `python src/run_region.py --config …
+{offsets|dineof|validate|all}` do the same.
 
 Each stage writes its outputs under `<region.out_dir>/<aoi>[_<tag>]/`:
 
@@ -68,7 +94,7 @@ Common options:
 
 | Option | Applies to | Effect |
 |---|---|---|
-| `--tag T` | all stages | writes to `<aoi>_T/` so that variants sit side by side; later stages read the same tag |
+| `--tag T` | stages, `status`, `figures` | writes to `<aoi>_T/` so that variants sit side by side; later stages read the same tag |
 | `--masks CUBE` | `offsets` | uses the cloud masks from a stage-2 cube instead of the sensor QC alone (see stage 1) |
 | `--max-iter N` | `dineof` | overrides `loop.max_iter`, e.g. for a quick trial run |
 | `--no-figures` | all stages | writes data and reports only |
@@ -76,18 +102,15 @@ Common options:
 ### Setting up a new region
 
 1. Build the source datacube with `coastal_sst_data` (see [Input data](#input-data)).
-2. Copy `configs/region.template.yaml` to `configs/region.<aoi>.yaml`. Every section is
-   documented there with its default value.
-3. Set the required keys:
-   - `region.aoi`: names the output directory;
-   - `region.source`: path to the cube;
-   - `validation.insitu`: a file, or `null` to use in-situ channels carried in the cube.
-
-   Check the `sensors` channel names against your cube. They default to `coastal_sst_data`'s
-   names.
+2. Create the config:
+   `nearshore-sst init my_region --source data/unfiltered/my_region.zarr [--insitu FILE]`.
+   It copies `configs/region.template.yaml`, where every section is documented with its
+   default. Check the `sensors` channel names against your cube; they default to
+   `coastal_sst_data`'s names.
+3. Run `nearshore-sst check -c configs/region.my_region.yaml` and fix any error it reports.
 4. Run `offsets` and review `stage1_offsets/figures/` (see [Stage 1](#stage-1-offsets)).
 5. Run `dineof` and review the CV and cloud-filter figures.
-6. Run `validate`.
+6. Run `validate`. `nearshore-sst status` summarises where a region stands at any point.
 
 ### Environment
 
@@ -218,7 +241,7 @@ settings, warm-started from the coarse fit.
 ## Stage 1: offsets
 
 ```bash
-python src/run_region.py --config configs/region.<aoi>.yaml offsets [--tag T] [--masks CUBE]
+nearshore-sst offsets --config configs/region.<aoi>.yaml [--tag T] [--masks CUBE]
 ```
 
 Code: `src/stage1_offsets.py`, configured by the `offsets:` section.
@@ -293,8 +316,8 @@ offset fit. Their medians are several kelvin cold, which inflates the LOSO error
 Within-scene clipping cannot remove them. Once stage 2 has produced cloud masks, re-run:
 
 ```bash
-python src/run_region.py --config ... offsets --tag v2 --masks data/regions/<aoi>/stage2_dineof/<aoi>_dineof.zarr
-python src/run_region.py --config ... dineof  --tag v2
+nearshore-sst offsets --config ... --tag v2 --masks data/regions/<aoi>/stage2_dineof/<aoi>_dineof.zarr
+nearshore-sst dineof  --config ... --tag v2
 ```
 
 On Admiralty Inlet this lowered the ECOSTRESS LOSO RMSE from 1.05 K to 0.75 K.
@@ -302,7 +325,7 @@ On Admiralty Inlet this lowered the ECOSTRESS LOSO RMSE from 1.05 K to 0.75 K.
 ## Stage 2: DINEOF and the cloud filter
 
 ```bash
-python src/run_region.py --config configs/region.<aoi>.yaml dineof [--tag T] [--max-iter N]
+nearshore-sst dineof --config configs/region.<aoi>.yaml [--tag T] [--max-iter N]
 ```
 
 Code: `src/stage2_dineof.py`, which wraps `src/pipeline.py`. It needs stage 1's `offsets.json`
@@ -393,7 +416,7 @@ It slows down sharply if the machine starts swapping. To reduce memory:
 ## Stage 3: in-situ validation
 
 ```bash
-python src/run_region.py --config configs/region.<aoi>.yaml validate [--tag T]
+nearshore-sst validate --config configs/region.<aoi>.yaml [--tag T]
 ```
 
 Code: `src/stage3_validate.py`, which wraps `src/validate_insitu.py`. It needs the stage-2 cube
@@ -414,7 +437,7 @@ Set `validation.insitu` to one of:
 To download IOOS stations (NDBC, NOAA CO-OPS, regional associations) for a cube's footprint:
 
 ```bash
-python scripts/fetch_insitu.py --cube data/unfiltered/<aoi>.zarr \
+nearshore-sst fetch-insitu --cube data/unfiltered/<aoi>.zarr \
     --start 2025-03-01 --end 2026-02-28 --out data/insitu/<aoi>_insitu.nc [--halo-km 5] [--dry-run]
 ```
 
