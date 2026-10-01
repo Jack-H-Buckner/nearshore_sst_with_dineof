@@ -90,9 +90,8 @@ import simple_outlier_detection as sod                      # noqa: E402
 from compare_lowrank import auc                             # noqa: E402
 from outlier_detection import DEFAULTS as OD_DEFAULTS       # noqa: E402
 
-from coastal_sst_data import provenance, store              # noqa: E402
-from coastal_sst_data.config import CompressionSpec         # noqa: E402
-from coastal_sst_data.processes import datacube             # noqa: E402
+from nearshore_sst import provenance, store, datacube       # noqa: E402
+from nearshore_sst.datacube import CompressionSpec          # noqa: E402
 
 log = logging.getLogger("iterative_filter")
 

@@ -7,10 +7,10 @@ name = "nearshore-sst-dineof"
 version = "0.1.0"
 description = "Nearshore SST from MODIS, ECOSTRESS and Landsat: offsets, iterative DINEOF cloud filtering and gap filling, in-situ validation"
 requires-python = ">=3.11"
-# The coastal_sst_data conda environment provides these (and coastal_sst_data itself);
-# install with `pip install -e . --no-deps` inside it.
+# Install with `pip install -e .` (or inside a compatible conda environment).
 dependencies = [
-    "numpy", "scipy", "pandas", "xarray", "zarr", "matplotlib", "pyproj", "pyyaml",
+    "numpy", "scipy", "pandas", "xarray", "zarr", "numcodecs", "matplotlib",
+    "pyproj", "pyyaml", "pydantic>=2.7",
 ]
 
 [project.scripts]

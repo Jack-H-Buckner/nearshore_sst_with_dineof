@@ -50,9 +50,8 @@ import edineof as E                                         # noqa: E402
 import standardize as S                                     # noqa: E402
 from seasonal_smoothing import FIT_FULL, design_matrix      # noqa: E402
 
-from coastal_sst_data import provenance, store              # noqa: E402
-from coastal_sst_data.config import CompressionSpec         # noqa: E402
-from coastal_sst_data.processes import datacube             # noqa: E402
+from nearshore_sst import provenance, store, datacube       # noqa: E402
+from nearshore_sst.datacube import CompressionSpec          # noqa: E402
 
 log = logging.getLogger("pipeline")
 

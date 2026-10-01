@@ -77,9 +77,8 @@ from seasonal_smoothing import design_matrix             # noqa: E402
 import edineof_figures                                   # noqa: E402  (DINEOF's own src/)
 import plotting                                          # noqa: E402
 
-from coastal_sst_data import provenance, store           # noqa: E402
-from coastal_sst_data.config import CompressionSpec      # noqa: E402
-from coastal_sst_data.processes import datacube          # noqa: E402
+from nearshore_sst import provenance, store, datacube    # noqa: E402
+from nearshore_sst.datacube import CompressionSpec       # noqa: E402
 
 log = logging.getLogger("edineof")
 

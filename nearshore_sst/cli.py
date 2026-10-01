@@ -21,7 +21,6 @@ import path when a command runs. Install with `pip install -e .` from the repo r
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import logging
 import sys
@@ -237,15 +236,6 @@ def cmd_figures(args) -> int:
     return 0
 
 
-def cmd_fetch_insitu(args, rest) -> int:
-    path = REPO / "scripts" / "fetch_insitu.py"
-    spec = importlib.util.spec_from_file_location("fetch_insitu", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    mod.main(rest)
-    return 0
-
-
 # ==================================================================== parser
 
 def build_parser() -> argparse.ArgumentParser:
@@ -289,18 +279,11 @@ def build_parser() -> argparse.ArgumentParser:
     with_config("status", "show what each stage has produced", cmd_status)
     with_config("figures", "re-draw stage 2's figures from its cube", cmd_figures)
 
-    s = sub.add_parser("fetch-insitu", add_help=False,
-                       help="download IOOS in-situ temperature for a cube's footprint "
-                            "(arguments as scripts/fetch_insitu.py; --help for them)")
-    s.set_defaults(func=None)
     return p
 
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv[:1] == ["fetch-insitu"]:
-        logging.basicConfig(level=logging.INFO, format="%(message)s")
-        return cmd_fetch_insitu(None, argv[1:])
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(message)s")
