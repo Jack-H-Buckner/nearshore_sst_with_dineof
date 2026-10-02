@@ -4,6 +4,9 @@
                      one row per mode: the spatial EOF on the map, and its loadings against
                      time -- full-data sigma*V and, for the smooth field, MODIS-only. Ticks mark
                      MODIS days, shading the days no MODIS reached (smooth = climatology).
+  seasonal.png       the per-pixel seasonal climatology: mean and robust-scale maps, the
+                     amplitude and phase of each harmonic, the fit method (full / mean-only /
+                     reference) as a categorical map, and the reconstructed annual cycle.
   cv_curves.png      the coarse CV search: point- and day-holdout RMSE against k, per T_c.
   cloud_filter_<id>.png
                      per pixel: share of observations removed and verdict flips across the
@@ -39,11 +42,17 @@ import iterative_filter  # noqa: F401  (bridges seasonal_smoothing for the impor
 import iterative_diagnostics as ID
 import plotting
 from cube_figures import GRID, INK, INK_MUTED, INK_SECONDARY, SURFACE
+from seasonal_smoothing import (amplitude_phase, design_matrix,  # noqa: E402
+                                FIT_FULL, FIT_MEAN_ONLY, FIT_REFERENCE)
 
 log = logging.getLogger("pipeline_figures")
 
 MODIS_LINE = "#2a78d6"
 FULL_LINE = INK_MUTED
+
+# fit-method colours: full fit, mean-only (reference shape), reference wholesale
+FIT_COLORS = {FIT_FULL: "#1baf7a", FIT_MEAN_ONLY: "#f0a202", FIT_REFERENCE: "#c92a2a"}
+FIT_LABELS = {FIT_FULL: "full", FIT_MEAN_ONLY: "mean-only", FIT_REFERENCE: "reference"}
 
 
 def _style(ax) -> None:
@@ -101,6 +110,111 @@ def eof_figure(ds: xr.Dataset, suffix: str, out: Path, dpi: int) -> None:
     if status is not None and suffix == "":
         title += f".  Shaded: {int((status == 2).sum())} days no MODIS reached"
     fig.suptitle(title, fontsize=9, color=INK, ha="left", x=0.01)
+    plotting.save(fig, out)
+
+
+def seasonal_figure(ds: xr.Dataset, out: Path, dpi: int) -> None:
+    """The per-pixel seasonal climatology: mean, scale and the amplitude/phase of each harmonic
+    as maps, the fit method as a categorical map, and the reconstructed annual cycle.
+
+    The map column echoes the EOF figure: one spatial field per row. The right panel is the
+    seasonal analogue of the EOF loadings -- the annual cycle across the water, with a
+    representative pixel and the reference cycle the thin-data pixels borrow.
+    """
+    import matplotlib.patches as mpatches
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+
+    coef = ds["sst_seasonal_coef"].values                 # (P, y, x)
+    scale = ds["sst_seasonal_sd"].values                  # (y, x)
+    ftype = ds["sst_seasonal_fit_type"].values            # (y, x), -1 land / 0 / 1 / 2
+    H = int(ds["sst_seasonal_coef"].attrs.get("n_harmonics", (coef.shape[0] - 1) // 2))
+    period = float(ds["sst_seasonal_coef"].attrs.get("period_days", 365.25))
+    water = plotting.water_mask(ds)
+    extent = plotting.extent_km(ds)
+
+    nrows = 1 + H                                          # row 0: mean|scale|fit; then amp|phase
+    fig = plt.figure(figsize=(15, 3.0 * nrows + 0.8), dpi=dpi, layout="constrained")
+    gs = fig.add_gridspec(nrows, 4, width_ratios=[1, 1, 1, 2.6])
+
+    def _map(r, c, data, cmap, title, *, cyclic=False, tight=False, vmax=None):
+        ax = fig.add_subplot(gs[r, c])
+        w = np.isfinite(data[water])
+        if cyclic:
+            vmin, vhi = 0.0, period
+        elif tight:                                       # absolute field: percentile window
+            vmin, vhi = (float(np.nanpercentile(data[water], 1)),
+                         float(np.nanpercentile(data[water], 99))) if w.any() else (0.0, 1.0)
+            if vmin == vhi:
+                vmin, vhi = vmin - 0.5, vhi + 0.5         # flat field: keep a usable range
+        else:                                             # magnitude field anchored at 0
+            vmin = 0.0
+            vhi = vmax or (float(np.nanpercentile(data[water], 99)) if w.any() else 1.0)
+        im = plotting.panel(ax, data, water, vmin=vmin, vmax=vhi, extent=extent, cmap=cmap)
+        ax.set_title(title, fontsize=8, color=INK)
+        ax.set_xticks([]); ax.set_yticks([])
+        fig.colorbar(im, ax=ax, shrink=0.8).ax.tick_params(labelsize=6)
+        return ax
+
+    _map(0, 0, coef[0], plt.get_cmap("RdYlBu_r"), "mean (c0) [K]", tight=True)
+    _map(0, 1, scale, plt.get_cmap("viridis"), "robust scale (SD) [K]")
+
+    # fit-method map (categorical): full / mean-only / reference over water, land flat grey
+    axf = fig.add_subplot(gs[0, 2])
+    axf.set_facecolor("none")
+    plotting.flat(axf, ~water, "#d9d9d9", extent)
+    counts = {}
+    for val, color in FIT_COLORS.items():
+        m = (ftype == val) & water
+        counts[val] = int(m.sum())
+        if m.any():
+            plotting.flat(axf, m, color, extent)
+    axf.set_title("fit method", fontsize=8, color=INK)
+    axf.set_xticks([]); axf.set_yticks([])
+    axf.set_xlim(extent[0], extent[1]); axf.set_ylim(extent[2], extent[3])
+    axf.legend(handles=[mpatches.Patch(color=FIT_COLORS[v],
+                                       label=f"{FIT_LABELS[v]} ({counts[v]:,})")
+                        for v in (FIT_FULL, FIT_MEAN_ONLY, FIT_REFERENCE)],
+               fontsize=6, frameon=False, loc="lower left")
+
+    twilight = plt.get_cmap("twilight")
+    for k in range(1, H + 1):
+        amp, peak = amplitude_phase(coef, k, period)      # each (y, x)
+        _map(k, 0, amp, plt.get_cmap("magma"), f"harmonic {k}: amplitude [K]")
+        _map(k, 1, peak * k, twilight, f"harmonic {k}: phase (peak DOY)", cyclic=True)
+
+    # right: the reconstructed annual cycle across the water, one full period at daily step
+    axc = fig.add_subplot(gs[:, 3])
+    coef_w = coef[:, water]                                # (P, N_water)
+    t0 = pd.to_datetime(ds["time"].values[0]).normalize()
+    year = t0 + pd.to_timedelta(np.arange(int(round(period))), unit="D")
+    Xy = design_matrix(year, H, period)                   # (365, P)
+    cyc = Xy @ coef_w                                      # (365, N_water)
+    doy = np.arange(cyc.shape[0])
+    lo, med, hi = np.nanpercentile(cyc, [10, 50, 90], axis=1)
+    axc.fill_between(doy, lo, hi, color=MODIS_LINE, alpha=0.15,
+                     label="10-90th pct across water")
+    axc.plot(doy, med, color=MODIS_LINE, linewidth=2, label="median pixel cycle")
+    full_mask = (ftype == FIT_FULL) & water
+    if full_mask.any():
+        ref = coef[:, full_mask].mean(axis=1)             # the reference cycle (mean of FULL)
+        axc.plot(doy, Xy @ ref, color=INK, linewidth=1.6, linestyle="--",
+                 label="reference cycle (mean of full fits)")
+        amp1 = np.hypot(coef[1][full_mask], coef[2][full_mask])
+        pick = np.flatnonzero(full_mask.ravel())[int(np.argmin(
+            np.abs(amp1 - np.median(amp1))))]
+        rep_cycle = Xy @ coef.reshape(coef.shape[0], -1)[:, pick]
+        axc.plot(doy, rep_cycle, color=FULL_LINE, linewidth=1.4, alpha=0.9,
+                 label="representative full-fit pixel")
+    _style(axc)
+    axc.set_xlabel("day of year", fontsize=8)
+    axc.set_ylabel("seasonal SST [K]", fontsize=8, color=INK_SECONDARY)
+    axc.set_xlim(0, cyc.shape[0] - 1)
+    axc.legend(fontsize=7, frameon=False, loc="best")
+
+    n_full, n_mean, n_ref = counts[FIT_FULL], counts[FIT_MEAN_ONLY], counts[FIT_REFERENCE]
+    fig.suptitle(f"Seasonal climatology: {H} harmonic(s), period {period:g} d.  "
+                 f"{n_full:,} full / {n_mean:,} mean-only / {n_ref:,} reference pixels",
+                 fontsize=9, color=INK, ha="left", x=0.01)
     plotting.save(fig, out)
 
 
@@ -269,6 +383,9 @@ def render(cube: Path, fig_dir: Path, rep_dir: Path | None = None, *, dpi: int =
 
     eof_figure(ds, "", fig_dir / "eofs.png", dpi)
     eof_figure(ds, "_point", fig_dir / "eofs_point.png", dpi)
+
+    if "sst_seasonal_coef" in ds:
+        seasonal_figure(ds, fig_dir / "seasonal.png", dpi)
 
     if rep_dir is not None and (rep_dir / "cv_curve.csv").exists():
         cv_figure(pd.read_csv(rep_dir / "cv_curve.csv"),

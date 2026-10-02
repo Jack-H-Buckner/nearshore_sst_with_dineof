@@ -173,6 +173,11 @@ def run(rc: dict, *, tag: str | None = None, figures: bool = True) -> dict:
         dpi = int(rc["validation"]["dpi"])
         mse_by_site_figure(met, match, out / "mse_by_site.png", dpi)
         residuals_figure(mu, match, out / "residuals.png", dpi)
+    if not mu.empty and "seasonal_fit" in mu.columns:
+        per_station = (mu.drop_duplicates("station_id")
+                       .sort_values("station_id")[["station_id", "row", "col", "seasonal_fit"]])
+        log.info("stage 3 seasonal fit at each in-situ pixel:\n%s",
+                 per_station.to_string(index=False))
     if not met.empty:
         allm = met[met["stratum"] == "all"][["match", "product", "n", "mse", "rmse", "bias"]]
         log.info("stage 3 MSE (all sites):\n%s", allm.to_string(

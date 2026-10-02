@@ -118,9 +118,9 @@ def test_figures_render(run, tmp_path):
     import pipeline_figures
     _, out, _ = run
     pipeline_figures.render(out["cube"], tmp_path, out["reports"], dpi=50)
-    for f in ("eofs.png", "eofs_point.png", "cv_curves.png", "cloud_filter_eco.png",
-              "cloud_filter_lst.png", "flag_changes.png", "fields_1.png", "offsets_eco.png",
-              "offsets_lst.png"):
+    for f in ("eofs.png", "eofs_point.png", "seasonal.png", "cv_curves.png",
+              "cloud_filter_eco.png", "cloud_filter_lst.png", "flag_changes.png",
+              "fields_1.png", "offsets_eco.png", "offsets_lst.png"):
         assert (tmp_path / f).exists(), f
 
 

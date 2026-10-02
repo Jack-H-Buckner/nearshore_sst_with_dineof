@@ -75,9 +75,18 @@ DEFAULTS = {
 MATCHES = ("overpass", "daily_mean", "reference")
 MATCHUP_COLS = ["station_id", "station_name", "row", "col", "snap_m", "date", "t", "match",
                 "insitu", "dt_min", "coverage", "pixel_observed", "day_constrained",
-                "loading_status", "season"]
+                "loading_status", "seasonal_fit", "season"]
 SEASONS = {12: "DJF", 1: "DJF", 2: "DJF", 3: "MAM", 4: "MAM", 5: "MAM",
            6: "JJA", 7: "JJA", 8: "JJA", 9: "SON", 10: "SON", 11: "SON"}
+# sst_seasonal_fit_type codes -> label (seasonal_smoothing FIT_*: 0 ref, 1 mean-only, 2 full)
+SEASONAL_FITS = {-1: "land", 0: "reference", 1: "mean-only", 2: "full"}
+
+
+def _seasonal_fit_label(ftype: np.ndarray | None, row: int, col: int) -> str:
+    """The seasonal climatology fit method at a station's pixel, as a label."""
+    if ftype is None or row < 0 or col < 0:
+        return "unknown"
+    return SEASONAL_FITS.get(int(ftype[row, col]), "unknown")
 
 
 def load_config(path: Path | None) -> dict:
@@ -356,6 +365,7 @@ def build_matchups(ds: xr.Dataset, cfg: dict, insitu: pd.DataFrame | None) -> tu
                    if "sst_filled_constrained" in ds else np.ones(len(days), bool))
     status = (ds["smooth_loading_status"].values if "smooth_loading_status" in ds
               else np.full(len(days), -1))
+    ftype = (ds["sst_seasonal_fit_type"].values if "sst_seasonal_fit_type" in ds else None)
     rows = []
     for match, (val, aux) in values.items():
         for k, s in ok.iterrows():
@@ -371,6 +381,7 @@ def build_matchups(ds: xr.Dataset, cfg: dict, insitu: pd.DataFrame | None) -> tu
                          else False,
                          day_constrained=bool(constrained[j]),
                          loading_status=int(status[j]),
+                         seasonal_fit=_seasonal_fit_label(ftype, int(s["row"]), int(s["col"])),
                          season=SEASONS[days[j].month])
                 for p in products + ["climatology"]:
                     if p in samp:

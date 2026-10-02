@@ -45,7 +45,9 @@ def make_cube(path, *, insitu_channels=None):
             "smooth_loading_status": (("time",), np.zeros(T, "int8")),
             "landcover_water": (("y", "x"), water.astype("uint8")),
             "modis_hour_aqua": (("time",), hour),
-            "sst_seasonal_coef": (("term", "y", "x"), coef)}
+            "sst_seasonal_coef": (("term", "y", "x"), coef),
+            "sst_seasonal_fit_type": (("y", "x"),
+                                      np.where(water, 2, -1).astype("int8"))}
     ds = xr.Dataset(data, coords={"time": times, "y": y, "x": x})
     ds["sst_seasonal_coef"].attrs.update(n_harmonics=1, period_days=365.25)
     ds.attrs["crs"] = CRS
@@ -102,6 +104,8 @@ def test_exact_match_overpass_and_daily_mean(cube):
     assert (mu["match"] == "overpass").sum() == T and (mu["match"] == "daily_mean").sum() == T
     # day 5 has no MODIS hour: it falls back to the record's median hour, still matched
     assert 5 in set(mu.loc[mu["match"] == "overpass", "t"])
+    # the seasonal fit method at the station's water pixel (fit_type 2 -> "full")
+    assert (mu["seasonal_fit"] == "full").all()
 
 
 def test_overpass_tolerance(cube):
