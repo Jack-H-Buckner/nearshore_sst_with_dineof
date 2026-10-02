@@ -380,21 +380,23 @@ def filter_settings(t_c_grid, alpha_max: float) -> list[dict]:
 
 
 def choose_cv_points(observed: np.ndarray, msk: np.ndarray, cfg: dict, rng: np.random.Generator
-                     ) -> tuple[np.ndarray, np.ndarray]:
-    """(day_mask, point_mask): two disjoint held-out subsets of `observed`.
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(day_mask, hsp_mask, dg_mask): three disjoint held-out subsets of `observed`.
 
-    DAY MASK -- `cv.day_frac` of the days that have data, held out whole. Selects p.
+    DAY MASK -- `cv.day_frac` of the days that have data, held out whole. Used as a validation
+      metric for the "empty day" fit; not used for k/T_c selection of the "point" fit.
 
-    POINT MASK -- `cv.frac` of the points in the REMAINING days, using donor geometry: the gap
-    mask of another real day is pasted onto the target, so the held-out shape is a contiguous
-    cloud like the gaps actually being filled rather than scattered pixels each surrounded by
-    data. The doc (§6) is explicit that uniform-random points are optimistic for this reason.
+    HSP MASK -- pixels seen only by "hold" sensors (the `valid_msk` from composite_blocked).
+      These are days that have data but where a pixel's composite value came entirely from the
+      held-out sensors, so the pixel is naturally a free holdout.
 
-    Donor geometry needs two guards the doc does not mention, because pasting is unbounded:
-    a sparse donor on a dense target holds out almost the entire target day, which both blows
-    the budget and can empty the day, recreating the zero-column degeneracy on a day that is
-    supposed to be scoring. So donors are drawn from a coverage band around the target, and
-    the result is capped at `cv.max_date_frac` and floored at `cv.min_date_obs_after`.
+    DG MASK -- donor-geometry pixels on the remaining days, excluding any pixel already in the
+      HSP mask. For each available day a donor day of similar coverage is chosen, and the
+      intersection of (observed on target) AND (gap on donor) AND (not in HSP) gives a cloud-
+      shaped holdout blob. Capped at `cv.max_date_frac` and floored at `cv.min_date_obs_after`
+      so the day stays scoreable. `cv.frac` sets the per-day pixel budget.
+
+    HSP + DG form the combined point holdout that selects k and T_c for the point fit.
     """
     c = cfg["cv"]
     m, n = observed.shape
@@ -408,43 +410,44 @@ def choose_cv_points(observed: np.ndarray, msk: np.ndarray, cfg: dict, rng: np.r
         day_mask[:, hold] = observed[:, hold]
 
     avail = np.setdiff1d(data_days, hold)
-    point_mask = np.zeros_like(observed)
-    point_mask = np.transpose(msk)
-    # budget = float(c["frac"]) * float(observed[:, avail].sum())
-    # lo, hi = float(c["donor_lo"]), float(c["donor_hi"])
-    #got = 0.0
+    hsp_mask = np.transpose(msk)
+
+    # Donor-geometry holdout: cloud-shaped blobs on available days, disjoint from HSP.
+    dg_mask = np.zeros_like(observed)
+    lo, hi = float(c["donor_lo"]), float(c["donor_hi"])
     # EVERY available day contributes its own share rather than the budget being spent on
     # whichever dense days come first: a holdout concentrated on a handful of days estimates
-    # the error on those days, not on the series. Each day's share is drawn from within a
-    # donor cloud, so the points stay spatially clustered like a real gap even when the cloud
-    # has to be thinned to fit.
-    # for tgt in rng.permutation(avail):
-    #     cov = date_n[tgt]
-    #     want = float(c["frac"]) * cov
-    #     cap = min(float(c["max_date_frac"]) * cov, cov - float(c["min_date_obs_after"]), want)
-    #     if cap < 1:
-    #         continue
-    #     band = avail[(date_n[avail] >= lo * cov) & (date_n[avail] <= hi * cov) & (avail != tgt)]
-    #     if band.size == 0:
-    #         continue
-    #     cand = np.flatnonzero(observed[:, tgt] & ~observed[:, rng.choice(band)])
-    #     if cand.size == 0:
-    #         continue
-    #     if cand.size > cap:
-    #         cand = rng.choice(cand, size=int(cap), replace=False)
-    #     point_mask[cand, tgt] = True
-    #     got += cand.size
+    # the error on those days, not on the series.
+    for tgt in rng.permutation(avail):
+        cov = date_n[tgt]
+        want = float(c["frac"]) * cov
+        cap = min(float(c["max_date_frac"]) * cov, cov - float(c["min_date_obs_after"]), want)
+        if cap < 1:
+            continue
+        band = avail[(date_n[avail] >= lo * cov) & (date_n[avail] <= hi * cov) & (avail != tgt)]
+        if band.size == 0:
+            continue
+        # Only pixels observed on tgt, NOT already in the HSP holdout, NOT seen on the donor day.
+        cand = np.flatnonzero(observed[:, tgt] & ~hsp_mask[:, tgt]
+                              & ~observed[:, rng.choice(band)])
+        if cand.size == 0:
+            continue
+        if cand.size > cap:
+            cand = rng.choice(cand, size=int(cap), replace=False)
+        dg_mask[cand, tgt] = True
 
-    log.info("cv: %d of %d data-days held out whole (%.1f%% of observations); "
-             "%d scattered points in %d other days (%.2f%%)",
-             hold.size, data_days.size, 100 * day_mask.sum() / observed.sum(),
-             int(point_mask.sum()), int((point_mask.any(axis=0)).sum()),
-             100 * point_mask.sum() / observed.sum())
-    # if got < 0.5 * budget:
-    #     log.warning("cv: only reached %.2f%% of the %.2f%% point budget -- donor band "
-    #                 "[%.2f, %.2f] may be too narrow for this coverage distribution",
-    #                 100 * got / observed.sum(), 100 * float(c["frac"]), lo, hi)
-    return day_mask, point_mask
+    obs_total = max(observed.sum(), 1)
+    log.info("cv: %d of %d data-days held out whole (%.1f%% of obs); "
+             "HSP: %d px in %d days (%.2f%%); DG: %d px in %d days (%.2f%%)",
+             hold.size, data_days.size, 100 * day_mask.sum() / obs_total,
+             int(hsp_mask.sum()), int(hsp_mask.any(axis=0).sum()),
+             100 * hsp_mask.sum() / obs_total,
+             int(dg_mask.sum()), int(dg_mask.any(axis=0).sum()),
+             100 * dg_mask.sum() / obs_total)
+    if not dg_mask.any():
+        log.warning("cv: DG holdout is empty — combined point score will use HSP only. "
+                    "Consider increasing cv.frac or widening cv.donor_lo / cv.donor_hi.")
+    return day_mask, hsp_mask, dg_mask
 
 
 
@@ -453,17 +456,18 @@ def _rms(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.sqrt(np.mean((a - b) ** 2))) if a.size else float("nan")
 
 
-def _pick_k(curve: pd.DataFrame, rule: str, rel_tol: float) -> int:
+def _pick_k(curve: pd.DataFrame, rule: str, rel_tol: float,
+            col: str = "rmse_combined") -> int:
     """Smallest k within rel_tol of the best CV error, or the outright best.
 
     `parsimonious` is the default because DINEOF CV curves are notoriously flat near the
     optimum, so the argmin is often a coin toss between several k that differ by <1%, and the
     smaller one is the better-conditioned model.
     """
-    best = curve["rmse_point"].min()
+    best = curve[col].min()
     if rule == "best":
-        return int(curve.loc[curve["rmse_point"].idxmin(), "k"])
-    ok = curve[curve["rmse_point"] <= best * (1.0 + rel_tol)]
+        return int(curve.loc[curve[col].idxmin(), "k"])
+    ok = curve[curve[col] <= best * (1.0 + rel_tol)]
     return int(ok["k"].min())
 
 
@@ -528,11 +532,15 @@ def _fill_setting(
     t: np.ndarray,
     em: dict,
     mo: dict,
-    point_idx: np.ndarray,
+    hsp_idx: np.ndarray,
+    dg_idx: np.ndarray,
     day_idx: np.ndarray,
-    truth_point: np.ndarray,
+    truth_hsp: np.ndarray,
+    truth_dg: np.ndarray,
     truth_day: np.ndarray,
     sd: float,
+    hsp_w: float,
+    dg_w: float,
     warm_seeds: dict | None,
 ) -> list[dict]:
     """Run the k-loop for one filter setting; returns its grid-search rows.
@@ -558,24 +566,42 @@ def _fill_setting(
         X, hist = fill(X, gaps, k, t, alpha, p, float(em["tol"]), int(em["max_iter"]),
                        sd, label=f"T_c={tc:g}", work=work)
         Xf = X.reshape(-1)
-        e_point = _rms(Xf[point_idx], truth_point)
-        e_day = _rms(Xf[day_idx], truth_day)
+        e_hsp = _rms(Xf[hsp_idx], truth_hsp) if hsp_idx.size else float("nan")
+        e_dg  = _rms(Xf[dg_idx],  truth_dg)  if dg_idx.size  else float("nan")
+        e_day = _rms(Xf[day_idx], truth_day)  if day_idx.size else float("nan")
+        # Weighted combination; if one holdout is absent its weight drops to zero.
+        # Use explicit conditionals rather than multiplying by 0 — 0 * nan = nan in IEEE.
+        w_h = hsp_w if hsp_idx.size else 0.0
+        w_d = dg_w  if dg_idx.size  else 0.0
+        total_w = w_h + w_d
+        if total_w > 0:
+            num = (w_h * e_hsp if hsp_idx.size else 0.0) + (w_d * e_dg if dg_idx.size else 0.0)
+            e_combined = num / total_w
+        else:
+            e_combined = float("nan")
         step = work.gap_rms(X, work.prev)
         secs = time.time() - tk
-        log.info("  T_c=%-5g k=%-3d point %.5f  day %.5f  %3d iter  %5.1fs  "
-                 "warm-step %.4f%s", tc, k, e_point, e_day, hist["n_iter"], secs, step,
+        log.info("  T_c=%-5g k=%-3d hsp %.5f  dg %.5f  comb %.5f  day %.5f"
+                 "  %3d iter  %5.1fs  warm-step %.4f%s",
+                 tc, k, e_hsp, e_dg, e_combined, e_day,
+                 hist["n_iter"], secs, step,
                  "" if hist["converged"] else "  NOT CONVERGED")
         rows.append(dict(t_c=tc, alpha=alpha, p=p, k=k,
-                         rmse_point=e_point, rmse_day=e_day, seconds=secs,
+                         rmse_hsp=e_hsp, rmse_dg=e_dg, rmse_combined=e_combined,
+                         rmse_point=e_combined,    # backward-compat alias for rmse_combined
+                         rmse_day=e_day, seconds=secs,
                          warm_step=step, n_iter=hist["n_iter"],
                          converged=int(hist["converged"])))
-        errs.append(e_point)
+        errs.append(e_combined)
         n = int(mo["patience"])
         if len(errs) > n and all(errs[-i] > errs[-i - 1] for i in range(1, n + 1)):
             break
-    log.info("T_c=%g d (a=%.4g, p=%d): best point-CV %.4f at k=%d, day-CV %.4f "
-             "[%.0fs, %d k]", tc, alpha, p, min(errs), ks[int(np.argmin(errs))],
-             min(r["rmse_day"] for r in rows if r["t_c"] == tc),
+    valid_errs = [e for e in errs if not np.isnan(e)]
+    best_combined = min(valid_errs) if valid_errs else float("nan")
+    best_k = ks[int(np.nanargmin(errs))] if valid_errs else ks[0]
+    log.info("T_c=%g d (a=%.4g, p=%d): best combined-CV %.4f at k=%d, day-CV %.4f "
+             "[%.0fs, %d k]", tc, alpha, p, best_combined, best_k,
+             min((r["rmse_day"] for r in rows if r["t_c"] == tc), default=float("nan")),
              time.time() - t0, len(errs))
     return rows
 
@@ -601,18 +627,22 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
              "per-pixel seasonal mean)", mu)
 
     rng = np.random.default_rng(int(c["seed"]))
-    day_cv, point_cv = choose_cv_points(observed, valid_msk, cfg, rng)
+    day_cv, hsp_cv, dg_cv = choose_cv_points(observed, valid_msk, cfg, rng)
+    point_cv = hsp_cv | dg_cv          # combined point holdout (for gap construction)
     cv_any = day_cv | point_cv
 
     gaps = (~observed) | cv_any
 
-    # Index form of the two CV masks, so scoring is a 4M-element integer gather rather than
-    # two boolean selections (0.34 s per combination) over the full matrix. The truths must be
-    # captured BEFORE the held-out entries are zeroed below, or they are all zero.
-    point_idx = np.flatnonzero(point_cv.reshape(-1))
-    day_idx = np.flatnonzero(day_cv.reshape(-1))
-    truth_point = X0.reshape(-1)[point_idx].copy()
+    # Index form of the three CV masks, so scoring is integer gathers rather than boolean
+    # selections over the full matrix. Truths captured BEFORE held-out entries are zeroed.
+    hsp_idx   = np.flatnonzero(hsp_cv.reshape(-1))
+    dg_idx    = np.flatnonzero(dg_cv.reshape(-1))
+    day_idx   = np.flatnonzero(day_cv.reshape(-1))
+    truth_hsp = X0.reshape(-1)[hsp_idx].copy()
+    truth_dg  = X0.reshape(-1)[dg_idx].copy()
     truth_day = X0.reshape(-1)[day_idx].copy()
+    hsp_w     = float(c.get("hsp_weight", 1.0))
+    dg_w      = float(c.get("dg_weight",  1.0))
 
     sd = float(np.std(X0[observed & ~cv_any]))
     X0[gaps] = 0.0
@@ -635,8 +665,10 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
 
     n_workers = _max_workers(X0.shape[0], X0.shape[1], len(settings),
                              override=cfg.get("matrix", {}).get("n_workers"))
-    call_args = (X0, gaps, ks, t, em, mo, point_idx, day_idx,
-                 truth_point, truth_day, sd, warm_seeds)
+    call_args = (X0, gaps, ks, t, em, mo,
+                 hsp_idx, dg_idx, day_idx,
+                 truth_hsp, truth_dg, truth_day,
+                 sd, hsp_w, dg_w, warm_seeds)
 
     rows: list[dict] = []
     if n_workers >= 2:
@@ -664,34 +696,36 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
     curve = pd.DataFrame(rows)
     tcs = [s["t_c"] for s in settings]
     if (curve.groupby("t_c")["k"].max() == ks[-1]).all():
-        log.warning("the point-CV curve never turned up within the k grid (max %d) at any "
+        log.warning("the combined-CV curve never turned up within the k grid (max %d) at any "
                     "T_c. k_opt is the ceiling, not an optimum -- extend modes.k_grid", ks[-1])
 
-    # k from the point holdout (spatial rank); T_c from the day holdout (temporal reach). See
-    # the module docstring for why these cannot share a criterion.
+    # TWO OPTIMA — two genuinely different models for two genuinely different situations:
+    #
+    #   POINT FIT (dates WITH data): (k, T_c) from weighted mean of HSP + DG scores.
+    #     DG masks cloud-shaped blobs that need spatial borrowing → better T_c sensitivity
+    #     than the original HSP-only holdout, which saw little filtering signal.
+    #
+    #   DAY FIT (empty dates): (k, T_c) from day holdout (whole held-out days).
+    #     An empty day's reconstruction comes entirely from the temporal filter; this
+    #     criterion directly measures how well that filter fills the 180-day gaps.
+    #
+    # Per-T_c k selection uses the combined score; day_at then reads day-CV at those k values
+    # to check whether the filter buys anything over the climatology baseline.
+    point_cv_col = "rmse_combined" if not curve["rmse_combined"].isna().all() else "rmse_hsp"
     per_tc = {s["t_c"]: _pick_k(curve[curve["t_c"] == s["t_c"]], mo["rule"],
-                                float(mo["rel_tol"])) for s in settings}
-    col = "rmse_day" if day_cv.any() else "rmse_point"
+                                 float(mo["rel_tol"]), col=point_cv_col) for s in settings}
+    col = "rmse_day" if day_cv.any() else point_cv_col
     day_at = {tc: float(curve[(curve["t_c"] == tc) & (curve["k"] == per_tc[tc])][col].iloc[0])
               for tc in tcs}
     if not day_cv.any() and len(settings) > 1:
         log.warning(
-            "cv.day_frac = 0, so there is no day holdout and T_c is being selected on the "
-            "point holdout instead. Expect T_c = 0: a point-holdout pixel sits in a day whose "
-            "modes are already pinned by its own surviving pixels, so filtering can only "
-            "distort them. This reduces eDINEOF to plain DINEOF.")
-    # TWO OPTIMA, because the two holdouts want genuinely different models and measurement says
-    # the gap between them is large -- on admiralty_inlet, point-CV picks T_c=0/k=15 while
-    # day-CV picks T_c=8/k=2. That is not a tuning wobble, it is the physics: a date with its
-    # own pixels wants a rich basis and no smoothing distorting the modes it already pins,
-    # while a date with nothing wants a smooth low-rank field and long temporal reach to borrow
-    # from its neighbours. Forcing one setting to serve both compromises whichever matters more
-    # to the reader, so both are fitted and both are written.
+            "cv.day_frac = 0, so there is no day holdout and T_c for the day fit is being "
+            "selected on the combined point score instead. The day fit may be suboptimal.")
     if warm:
         tc_pt, k_pt = warm["tc_point"], warm["k_point"]
         tc_dy, k_dy = warm["tc_day"], warm["k_day"]
     else:
-        tc_pt, k_pt = _pick_setting(curve, "rmse_point", mo["rule"], float(mo["rel_tol"]))
+        tc_pt, k_pt = _pick_setting(curve, point_cv_col, mo["rule"], float(mo["rel_tol"]))
         if day_cv.any():
             tc_dy, k_dy = _pick_setting(curve, "rmse_day", mo["rule"], float(mo["rel_tol"]))
         else:
@@ -701,9 +735,9 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
     sel_s = next(s for s in settings if s["t_c"] == tc_opt)
     alpha, p_opt = sel_s["alpha"], sel_s["p"]
     base = day_at.get(0.0)
-    log.info("dates WITH data   -> T_c=%g d, k=%d  (point-CV %.4f)",
+    log.info("dates WITH data   -> T_c=%g d, k=%d  (combined-CV %.4f)",
              tc_pt, k_pt, float(curve[(curve["t_c"] == tc_pt) & (curve["k"] == k_pt)]
-                                ["rmse_point"].iloc[0]))
+                                [point_cv_col].iloc[0]))
     log.info("dates WITHOUT data-> T_c=%g d, k=%d  (%s %.4f%s)", tc_dy, k_dy, col,
              float(curve[(curve["t_c"] == tc_dy) & (curve["k"] == k_dy)][col].iloc[0]),
              f", vs {base:.4f} at T_c=0 -- the climatology baseline" if base is not None else "")
@@ -735,7 +769,8 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
                 if empty.any():
                     X[:, empty] = 0.0
         Xf = X.reshape(-1)
-        Xf[point_idx] = truth_point          # the held-out points are observations again
+        Xf[hsp_idx] = truth_hsp              # all three held-out sets are observations again
+        Xf[dg_idx]  = truth_dg
         Xf[day_idx] = truth_day
         X, hist = fill(X, final_gaps, k, t, s["alpha"], s["p"], float(em["tol"]),
                        int(em["max_iter"]), sd, label=label)
@@ -763,7 +798,8 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
                 day_fit=day_fit, point_fit=point_fit, same_setting=same,
                 k_opt=k_opt, p_opt=p_opt, alpha_opt=alpha, tc_opt=tc_opt,
                 k_day=k_dy, tc_day=tc_dy, mu=mu, sd=sd,
-                curve=curve, day_cv=day_cv, point_cv=point_cv, gaps=final_gaps,
+                curve=curve, day_cv=day_cv, point_cv=point_cv,
+                hsp_cv=hsp_cv, dg_cv=dg_cv, gaps=final_gaps,
                 history=hist, day_at=day_at, per_tc=per_tc, settings=settings,
                 var_explained=float(var[:k_opt].sum() / max(var.sum(), 1e-300)))
 
@@ -790,7 +826,8 @@ DEFAULTS = {
               "patience": 3, "sigma_convention": "projection", "fix_sign": True},
     "em": {"tol": 1.0e-3, "max_iter": 100},
     "cv": {"frac": 0.02, "day_frac": 0.10, "max_date_frac": 0.4, "min_date_obs_after": 50,
-           "donor_lo": 0.5, "donor_hi": 0.95, "seed": 0},
+           "donor_lo": 0.5, "donor_hi": 0.95, "seed": 0,
+           "hsp_weight": 1.0, "dg_weight": 1.0},
     "carry": [],
     "output": {
         "chunks": {"time": 64, "y": 128, "x": 128},

@@ -436,3 +436,106 @@ def test_composite_blocked_fused_steps(block_days):
     assert got["z"].dtype == np.float32
     assert np.allclose(got["z"], z_ref, equal_nan=True, rtol=1e-6, atol=1e-6)
     assert np.isnan(got["z"][:, ~water]).all()
+
+
+# --------------------------------------------------------------------------- segmentation helpers
+
+def test_subset_inputs():
+    """subset_inputs slices time arrays and remaps scenes/qc to the new index space."""
+    cfg = config()
+    inp, _ = make_inputs(cfg, patches=False)
+    T_full = len(inp.times)
+
+    # Take the middle third
+    rng = np.random.default_rng(42)
+    idx = np.sort(rng.choice(T_full, size=T_full // 2, replace=False))
+    sub = F.subset_inputs(inp, idx)
+
+    # --- time-dimension fields are sliced correctly
+    assert len(sub.times) == len(idx)
+    assert np.array_equal(sub.times, inp.times[idx])
+    assert sub.seasonal.shape[0] == len(idx)
+    for sid in inp.raw:
+        assert sub.raw[sid].shape[0] == len(idx)
+        assert sub.offsets[sid].shape[0] == len(idx)
+    for mid in inp.adj:
+        assert sub.adj[mid].shape[0] == len(idx)
+
+    # --- spatial fields are unchanged
+    assert np.array_equal(sub.water, inp.water)
+    assert np.array_equal(sub.scale, inp.scale)
+
+    # --- scenes are remapped to the new index space
+    idx_set = set(idx.tolist())
+    old_to_new = np.full(T_full, -1, dtype=int)
+    old_to_new[idx] = np.arange(len(idx))
+
+    for sid in inp.raw:
+        # Every scene index in the subset must be a valid new index
+        for new_j in sub.scenes[sid]:
+            assert 0 <= new_j < len(idx), new_j
+        # Scenes not in idx must be absent
+        kept_old = set(j for j in inp.scenes[sid] if j in idx_set)
+        assert len(sub.scenes[sid]) == len(kept_old)
+        # qc keys must match scenes
+        assert set(sub.qc[sid].keys()) == set(sub.scenes[sid])
+
+    # --- valid_inds are within bounds
+    assert (sub.valid_inds >= 0).all()
+    assert (sub.valid_inds < len(idx)).all()
+
+
+def test_make_windows():
+    """make_windows partitions the time axis exactly; overlap is correct; no gaps."""
+    # 400-day series, annual (365-day) windows, 20-day overlap
+    n = 400
+    times = (np.datetime64("2023-01-01") + np.arange(n)).astype("datetime64[ns]")
+    windows = F.make_windows(times, segment_years=1.0, overlap_days=20)
+
+    # Central indices must be a disjoint partition of 0..n-1
+    all_central = np.concatenate([c for _, c in windows])
+    assert np.array_equal(np.sort(all_central), np.arange(n)), \
+        "central indices do not partition the full time axis"
+
+    # Each window must contain its central indices
+    for w_idx, c_idx in windows:
+        assert set(c_idx).issubset(set(w_idx)), "central indices not inside window"
+
+    # Overlap: non-edge windows should extend beyond the central period
+    if len(windows) > 1:
+        _, (w1_idx, c1_idx) = 0, windows[0]
+        # First window's right edge >= last central date + overlap
+        assert w1_idx[-1] > c1_idx[-1], "first window has no right overlap"
+        w_last, c_last = windows[-1]
+        assert w_last[0] < c_last[0], "last window has no left overlap"
+
+    # No gaps in central coverage: sorted central indices cover 0..n-1 contiguously
+    assert all_central.min() == 0 and all_central.max() == n - 1
+    diffs = np.diff(np.sort(all_central))
+    assert (diffs == 1).all(), "gap in central coverage"
+
+
+def test_run_segmented_loop():
+    """run_segmented_loop with segment_years=0.1 (tiny windows) covers all times and returns
+    the same keys as run_loop."""
+    cfg = config(segment_years=0.1, segment_overlap_days=5)
+    inp, patch = make_inputs(cfg, patches=True)
+
+    out = F.run_segmented_loop(inp, cfg)
+
+    # Same keys as run_loop
+    for key in ("keep", "keep_bits", "p_valid", "table", "scene_history", "history"):
+        assert key in out, key
+
+    # keep covers the full time dimension
+    for sid in inp.raw:
+        assert out["keep"][sid].shape == inp.raw[sid].shape
+        assert out["keep_bits"][sid].shape == inp.raw[sid].shape
+        assert out["p_valid"][sid].shape == inp.raw[sid].shape
+
+    # table and scene_history contain entries for all scene dates
+    all_dates = {str(inp.times[j])[:10] for sid in inp.raw for j in inp.scenes[sid]}
+    table_dates = set(out["table"]["date"])
+    # Every scene date should appear in table (one row per pixel-scene verdict)
+    # At a minimum the set of dates in the table is a subset of all dates
+    assert table_dates.issubset(all_dates | {"nan"})

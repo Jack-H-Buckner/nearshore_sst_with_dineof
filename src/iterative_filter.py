@@ -44,6 +44,7 @@ import json
 import logging
 import sys
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -160,6 +161,8 @@ DEFAULTS = {
         "loading_tc": None,         # pooling cutoff, days; null = the fit's own T_c
         "loading_ridge": 1.0e-3,    # Tikhonov lambda, relative to the median trace(A_j)/k
         "loading_min_px": 5,        # a day with fewer MODIS matrix cells contributes nothing
+        "segment_years": None,      # None = no segmentation; 1.0 = annual, 0.5 = semi-annual
+        "segment_overlap_days": 30, # overlap on each side of a window (mitigates edge effects)
     },
     "output": {
         "chunks": {"time": 64, "y": 128, "x": 128},
@@ -262,6 +265,10 @@ def validate_loop(cfg: dict, path) -> None:
         raise ValueError(f"{path}: loop.loading_tc must be >= 0 or null")
     if float(lp["loading_ridge"]) < 0:
         raise ValueError(f"{path}: loop.loading_ridge must be >= 0")
+    if lp["segment_years"] is not None and float(lp["segment_years"]) <= 0:
+        raise ValueError(f"{path}: loop.segment_years must be > 0 or null")
+    if int(lp["segment_overlap_days"]) < 0:
+        raise ValueError(f"{path}: loop.segment_overlap_days must be >= 0")
     if int(lp["loading_min_px"]) < 1:
         raise ValueError(f"{path}: loop.loading_min_px must be >= 1")
     ref = cfg["reference"]["id"]
@@ -997,6 +1004,127 @@ def run_loop(inp: Inputs, cfg: dict, *, init_keep: dict | None = None,
                 keep_bits=bits, n_iter=len(scene_hist),
                 scene_history=pd.concat(scene_hist, ignore_index=True),
                 final_res=final_res)
+
+
+# ==================================================================== segmented runs
+
+
+def subset_inputs(inp: Inputs, idx: np.ndarray) -> Inputs:
+    """Return a new Inputs restricted to the given time indices.
+
+    idx: 1-D integer array of positions into inp.times (not a boolean mask).
+    scenes and qc are remapped to the new index space.
+    """
+    idx = np.asarray(idx)
+    old_to_new = np.full(len(inp.times), -1, dtype=int)
+    old_to_new[idx] = np.arange(len(idx))
+
+    new_scenes, new_qc = {}, {}
+    for sid in inp.raw:
+        kept = [j for j in inp.scenes[sid] if old_to_new[j] >= 0]
+        new_scenes[sid] = [int(old_to_new[j]) for j in kept]
+        new_qc[sid] = {int(old_to_new[j]): inp.qc[sid][j] for j in kept}
+
+    new_valid = old_to_new[inp.valid_inds]
+    new_valid = new_valid[new_valid >= 0]
+
+    return dataclasses.replace(
+        inp,
+        times=inp.times[idx],
+        seasonal=inp.seasonal[idx],
+        raw={sid: v[idx] for sid, v in inp.raw.items()},
+        adj={mid: v[idx] for mid, v in inp.adj.items()},
+        offsets={sid: v[idx] for sid, v in inp.offsets.items()},
+        valid_inds=new_valid,
+        scenes=new_scenes,
+        qc=new_qc,
+    )
+
+
+def make_windows(
+    times: np.ndarray,
+    segment_years: float,
+    overlap_days: int,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Split a time axis into overlapping windows of `segment_years` years.
+
+    Returns [(window_idx, central_idx), ...] where indices are into `times`.
+    The central_idx arrays partition times exactly — no date is double-counted.
+    Overlap on each side mitigates the zero-flux boundary effect in filter_time.
+    """
+    t = times.astype("datetime64[D]")
+    t0, t1 = t[0], t[-1]
+    span_days = int(segment_years * 365.25)
+    overlap = np.timedelta64(int(overlap_days), "D")
+
+    windows = []
+    cursor = t0
+    while cursor <= t1:
+        c_start = cursor
+        c_end = min(cursor + np.timedelta64(span_days, "D") - np.timedelta64(1, "D"), t1)
+        w_start = max(t0, c_start - overlap)
+        w_end = min(t1, c_end + overlap)
+
+        win_idx = np.flatnonzero((t >= w_start) & (t <= w_end))
+        cen_idx = np.flatnonzero((t >= c_start) & (t <= c_end))
+        windows.append((win_idx, cen_idx))
+        cursor = c_end + np.timedelta64(1, "D")
+    return windows
+
+
+def run_segmented_loop(inp: Inputs, cfg: dict) -> dict:
+    """Run run_loop on overlapping annual windows and stitch the results.
+
+    Climatology and offsets (already in inp) were fit on the full time series — only the
+    DINEOF gap-filling runs per window, keeping n ≈ segment_years×365 regardless of the
+    total record length.
+    """
+    lp = cfg["loop"]
+    windows = make_windows(inp.times, float(lp["segment_years"]),
+                           int(lp["segment_overlap_days"]))
+    log.info("segmented DINEOF: %d windows of ~%.2g yr with %d-day overlap",
+             len(windows), float(lp["segment_years"]), int(lp["segment_overlap_days"]))
+
+    # Pre-allocate full-T output arrays
+    all_keep   = {sid: np.zeros(inp.raw[sid].shape, bool)           for sid in inp.raw}
+    all_bits   = {sid: np.zeros(inp.raw[sid].shape, dtype="uint16") for sid in inp.raw}
+    all_pvalid = {sid: np.full(inp.raw[sid].shape, np.nan, "float32") for sid in inp.raw}
+    all_table, all_scenes, all_history = [], [], []
+    last_out = None
+
+    for w_num, (w_idx, c_idx) in enumerate(windows):
+        t_start = str(inp.times[c_idx[0]])[:10]
+        t_end   = str(inp.times[c_idx[-1]])[:10]
+        log.info("window %d/%d: %s – %s (%d dates, %d with overlap)",
+                 w_num + 1, len(windows), t_start, t_end, len(c_idx), len(w_idx))
+        w_inp = subset_inputs(inp, w_idx)
+        out = run_loop(w_inp, cfg)
+
+        # positions of the central dates inside the window array
+        c_in_win = np.flatnonzero(np.isin(w_idx, c_idx))
+        for sid in inp.raw:
+            all_keep[sid][c_idx]   = out["keep"][sid][c_in_win]
+            all_bits[sid][c_idx]   = out["keep_bits"][sid][c_in_win]
+            all_pvalid[sid][c_idx] = out["p_valid"][sid][c_in_win]
+
+        central_set = set(inp.times[c_idx].astype("datetime64[D]").astype(str))
+        # table = final-iteration classifications; scene_history = all iterations
+        all_table.append(out["table"][out["table"]["date"].isin(central_set)])
+        all_scenes.append(out["scene_history"][out["scene_history"]["date"].isin(central_set)])
+        all_history.append(out["history"].assign(window=w_num))
+        last_out = out
+
+    return dict(
+        last_out,
+        keep=all_keep,
+        keep_bits=all_bits,
+        p_valid=all_pvalid,
+        table=pd.concat(all_table, ignore_index=True),
+        scene_history=pd.concat(all_scenes, ignore_index=True),
+        history=pd.concat(all_history, ignore_index=True),
+        n_iter=last_out["n_iter"],
+        converged=last_out["converged"],
+    )
 
 
 # ==================================================================== evaluation (--compare)

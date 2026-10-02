@@ -958,7 +958,10 @@ def run_pipeline(cfg: dict, *, tag: str | None = None, figures: bool = True,
 
     # 5. cloud loop
     t0 = time.time()
-    loop_out = F.run_loop(inp0, it)
+    if it["loop"].get("segment_years"):
+        loop_out = F.run_segmented_loop(inp0, it)
+    else:
+        loop_out = F.run_loop(inp0, it)
     log.info("[5/9] cloud loop: %d iterations, converged=%s, %.0fs", loop_out["n_iter"],
              loop_out["converged"], time.time() - t0)
     del inp0

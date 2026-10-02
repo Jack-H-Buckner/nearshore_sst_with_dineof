@@ -328,3 +328,21 @@ def test_pipeline_no_depth_channel(tmp_path):
     out = P.run_pipeline(cfg, tag="t", figures=False)
     result = xr.open_zarr(out["cube"])
     assert "sst_filled" in result
+
+
+def test_pipeline_segmented(tmp_path):
+    """Pipeline with segment_years=0.5 produces sst_filled for all dates."""
+    src = tmp_path / "seg_source.zarr"
+    truth = SC.build(src)
+    cfg = P.build_config(
+        SC.pipeline_user_config(
+            src, tmp_path / "seg_out",
+            loop={"k": 2, "t_c": 4.0, "max_iter": 3,
+                  "segment_years": 0.5, "segment_overlap_days": 15},
+        ),
+        resolve=False,
+    )
+    out = P.run_pipeline(cfg, tag="seg", figures=False)
+    result = xr.open_zarr(out["cube"])
+    assert "sst_filled" in result
+    assert np.isfinite(result["sst_filled"].values[:, truth["water"]]).all()
