@@ -57,6 +57,7 @@ import json
 import logging
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -272,6 +273,7 @@ def fill(X: np.ndarray, gaps: np.ndarray, k: int, t: np.ndarray, alpha: float, p
     deltas, d_empty, d_seen = [], [], []
     d_abs, d_abs_empty, d_abs_seen = [], [], []
     norm = sd if sd > 0 else 1.0
+    log_every = max(1, int(max_iter) // 10)
     for it in range(int(max_iter)):
         U, sigma, V = top_k_modes(X, k, t, alpha, p, use_filter=True)
         np.matmul(U, sigma[:, None] * V.T, out=R)
@@ -311,6 +313,9 @@ def fill(X: np.ndarray, gaps: np.ndarray, k: int, t: np.ndarray, alpha: float, p
         d_abs.append(abs_gap / n_gaps if n_gaps else 0.0)
         d_abs_empty.append(abs_empty / w.n_gap_empty if w.n_gap_empty else float("nan"))
         d_abs_seen.append(abs_seen / w.n_gap_seen if w.n_gap_seen else float("nan"))
+        if (it + 1) % log_every == 0:
+            log.debug("    %sem it %d/%d  delta %.4e  (tol %.1e)",
+                      f"{label}: " if label else "", it + 1, int(max_iter), delta, tol)
         if delta < tol:
             return X, {"n_iter": it + 1, "deltas": deltas, "deltas_empty": d_empty,
                        "deltas_seen": d_seen, "deltas_abs": d_abs,
@@ -475,6 +480,106 @@ def _pick_setting(curve: pd.DataFrame, col: str, rule: str, rel_tol: float):
     return best_tc, int(ok["k"].min())
 
 
+def _available_ram() -> int | None:
+    """Available system RAM in bytes; None if it cannot be determined."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except ImportError:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def _max_workers(m: int, n: int, n_settings: int,
+                 headroom: float = 0.25, override: int | None = None) -> int:
+    """How many settings to run in parallel given available RAM.
+
+    Each worker needs ~4 full (m, n) float64 arrays (X copy + Workspace R/D/prev).
+    With headroom=0.25, at most 75% of available RAM is used.
+    """
+    if override is not None:
+        w = max(1, min(int(override), n_settings))
+        log.info("parallel: %d workers (explicit n_workers=%d)", w, int(override))
+        return w
+    avail = _available_ram()
+    if avail is None:
+        log.warning("cannot determine available RAM; grid search will run sequentially. "
+                    "Set edineof.matrix.n_workers to an integer to override.")
+        return 1
+    per_worker = 4 * m * n * 8
+    w = max(1, min(n_settings, int(avail * (1.0 - headroom) / per_worker)))
+    log.info("parallel: %d of %d settings (%.1f GB available, %.1f GB/worker)",
+             w, n_settings, avail / 1e9, per_worker / 1e9)
+    return w
+
+
+def _fill_setting(
+    s: dict,
+    X0: np.ndarray,
+    gaps: np.ndarray,
+    ks: list[int],
+    t: np.ndarray,
+    em: dict,
+    mo: dict,
+    point_idx: np.ndarray,
+    day_idx: np.ndarray,
+    truth_point: np.ndarray,
+    truth_day: np.ndarray,
+    sd: float,
+    warm_seeds: dict | None,
+) -> list[dict]:
+    """Run the k-loop for one filter setting; returns its grid-search rows.
+
+    Each call allocates its own Workspace so workers can safely run concurrently.
+    warm_seeds maps {t_c: seed_array} for the apply_seed logic (None = cold start).
+    """
+    alpha, p, tc = s["alpha"], s["p"], s["t_c"]
+    X = X0.copy()
+    if warm_seeds and tc in warm_seeds:
+        seed = warm_seeds[tc]
+        X[gaps] = seed[gaps]
+        if tc == 0:
+            empty = gaps.all(axis=0)
+            if empty.any():
+                X[:, empty] = 0.0
+    work = Workspace(X0, gaps)
+    rows, errs = [], []
+    t0 = time.time()
+    for k in ks:
+        tk = time.time()
+        np.copyto(work.prev, X)
+        X, hist = fill(X, gaps, k, t, alpha, p, float(em["tol"]), int(em["max_iter"]),
+                       sd, label=f"T_c={tc:g}", work=work)
+        Xf = X.reshape(-1)
+        e_point = _rms(Xf[point_idx], truth_point)
+        e_day = _rms(Xf[day_idx], truth_day)
+        step = work.gap_rms(X, work.prev)
+        secs = time.time() - tk
+        log.info("  T_c=%-5g k=%-3d point %.5f  day %.5f  %3d iter  %5.1fs  "
+                 "warm-step %.4f%s", tc, k, e_point, e_day, hist["n_iter"], secs, step,
+                 "" if hist["converged"] else "  NOT CONVERGED")
+        rows.append(dict(t_c=tc, alpha=alpha, p=p, k=k,
+                         rmse_point=e_point, rmse_day=e_day, seconds=secs,
+                         warm_step=step, n_iter=hist["n_iter"],
+                         converged=int(hist["converged"])))
+        errs.append(e_point)
+        n = int(mo["patience"])
+        if len(errs) > n and all(errs[-i] > errs[-i - 1] for i in range(1, n + 1)):
+            break
+    log.info("T_c=%g d (a=%.4g, p=%d): best point-CV %.4f at k=%d, day-CV %.4f "
+             "[%.0fs, %d k]", tc, alpha, p, min(errs), ks[int(np.argmin(errs))],
+             min(r["rmse_day"] for r in rows if r["t_c"] == tc),
+             time.time() - t0, len(errs))
+    return rows
+
+
 def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: np.ndarray, cfg: dict,
             warm: dict | None = None) -> dict:
     """The full algorithm, doc §7, with the k and p searches split across the two CV sets."""
@@ -517,66 +622,44 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
     # An explicit, non-uniform k grid: dense where the CV curve turns, sparse above. Doubling
     # k near 40 changes the reconstruction far less than doubling it near 4, so testing every
     # integer up there costs the most per fit and tells you the least.
-    def apply_seed(X: np.ndarray, gap_mask: np.ndarray, tc: float) -> None:
-        """Seed the gaps from the coarse field -- except where that would be a lie.
-
-        At T_c = 0 an all-gap column is STRUCTURALLY pinned at zero: B[:,j] = 0 so V[j,:] = 0
-        so the reconstruction is 0 forever. A warm start breaks that degeneracy artificially --
-        X[:,j] starts non-zero, so B[:,j] is non-zero, and the column then sustains whatever
-        the coarse run put there. Measured before this guard: max |z| of 1.6 on empty dates in
-        a fit labelled "no filter", where the cold-start value is a structural constant.
-        Those values were inherited from a FILTERED coarse run, so the channel did not mean
-        what its settings said. Zeroing them keeps T_c = 0 honest, and costs nothing: a column
-        the filter cannot reach has no information to start from anyway.
-        """
-        if not warm:
-            return
-        seed = warm["point"] if tc == warm["tc_point"] else warm["day"]
-        X[gap_mask] = seed[gap_mask]
-        if tc == 0:
-            empty = gap_mask.all(axis=0)
-            if empty.any():
-                X[:, empty] = 0.0
-
     ks = [int(v) for v in mo["k_grid"]]
-    work = Workspace(X0, gaps)
-    rows = []
-    for s in settings:
-        alpha, p, tc = s["alpha"], s["p"], s["t_c"]
-        X = X0.copy()
-        apply_seed(X, gaps, tc)              # coarse field at the gaps, not the mean
-        errs = []
-        t0 = time.time()
-        for k in ks:
-            tk = time.time()
-            np.copyto(work.prev, X)              # the warm start this fit begins from
-            X, hist = fill(X, gaps, k, t, alpha, p, float(em["tol"]), int(em["max_iter"]),
-                           sd, label=f"T_c={tc:g}", work=work)
-            Xf = X.reshape(-1)
-            e_point = _rms(Xf[point_idx], truth_point)
-            e_day = _rms(Xf[day_idx], truth_day)
-            # How far this k moved the solution from the previous k's. The warm start pays off
-            # only insofar as this falls with k -- flat means every k is effectively cold.
-            step = work.gap_rms(X, work.prev)
-            secs = time.time() - tk
-            # Per-k progress. A full sweep is thousands of EM iterations, so a run with only
-            # per-setting output is indistinguishable from a hang for minutes at a time.
-            log.info("  T_c=%-5g k=%-3d point %.5f  day %.5f  %3d iter  %5.1fs  "
-                     "warm-step %.4f%s", tc, k, e_point, e_day, hist["n_iter"], secs, step,
-                     "" if hist["converged"] else "  NOT CONVERGED")
-            rows.append(dict(t_c=tc, alpha=alpha, p=p, k=k,
-                             rmse_point=e_point, rmse_day=e_day, seconds=secs,
-                             warm_step=step, n_iter=hist["n_iter"],
-                             converged=int(hist["converged"])))
-            errs.append(e_point)
-            # The doc's rule: stop once CV has risen on `patience` consecutive k.
-            n = int(mo["patience"])
-            if len(errs) > n and all(errs[-i] > errs[-i - 1] for i in range(1, n + 1)):
-                break
-        log.info("T_c=%g d (a=%.4g, p=%d): best point-CV %.4f at k=%d, day-CV %.4f "
-                 "[%.0fs, %d k]", tc, alpha, p, min(errs), ks[int(np.argmin(errs))],
-                 min(r["rmse_day"] for r in rows if r["t_c"] == tc), time.time() - t0,
-                 len(errs))
+
+    # Build warm_seeds for _fill_setting (replaces the apply_seed closure).
+    warm_seeds: dict | None = None
+    if warm:
+        warm_seeds = {}
+        if warm.get("tc_point") is not None:
+            warm_seeds[warm["tc_point"]] = warm["point"]
+        if warm.get("tc_day") is not None:
+            warm_seeds[warm["tc_day"]] = warm["day"]
+
+    n_workers = _max_workers(X0.shape[0], X0.shape[1], len(settings),
+                             override=cfg.get("matrix", {}).get("n_workers"))
+    call_args = (X0, gaps, ks, t, em, mo, point_idx, day_idx,
+                 truth_point, truth_day, sd, warm_seeds)
+
+    rows: list[dict] = []
+    if n_workers >= 2:
+        try:
+            from threadpoolctl import threadpool_limits
+        except ImportError:
+            threadpool_limits = None
+            log.warning("threadpoolctl not found; BLAS threads will not be limited across "
+                        "parallel workers — consider: pip install threadpoolctl")
+
+        def _run(s):
+            if threadpool_limits is not None:
+                with threadpool_limits(limits=1, user_api="blas"):
+                    return _fill_setting(s, *call_args)
+            return _fill_setting(s, *call_args)
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_run, s): s for s in settings}
+            for fut in as_completed(futures):
+                rows.extend(fut.result())
+    else:
+        for s in settings:
+            rows.extend(_fill_setting(s, *call_args))
 
     curve = pd.DataFrame(rows)
     tcs = [s["t_c"] for s in settings]
@@ -644,7 +727,13 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
     def final_fit(tc: float, k: int, label: str) -> dict:
         s = next(q for q in settings if q["t_c"] == tc)
         X = X0.copy()
-        apply_seed(X, final_gaps, tc)
+        if warm_seeds and tc in warm_seeds:
+            seed = warm_seeds[tc]
+            X[final_gaps] = seed[final_gaps]
+            if tc == 0:
+                empty = final_gaps.all(axis=0)
+                if empty.any():
+                    X[:, empty] = 0.0
         Xf = X.reshape(-1)
         Xf[point_idx] = truth_point          # the held-out points are observations again
         Xf[day_idx] = truth_day
@@ -693,7 +782,7 @@ DEFAULTS = {
         "validation_msk": "validation_msk"
     },
     "matrix": {"min_pixel_obs": 1, "min_date_obs": 200, "coarsen": 1,
-               "warm_start_from": None},
+               "warm_start_from": None, "n_workers": None},
     "filter": {"t_c_grid": [0, 2, 4, 6, 8, 11], "alpha_max": 0.25,
                "stability_factor": 0.25},
     "modes": {"k_grid": [1, 2, 3, 4, 5, 7, 9, 11, 15, 20, 25, 30, 40],

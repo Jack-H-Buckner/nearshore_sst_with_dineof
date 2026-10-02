@@ -286,7 +286,8 @@ def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(message)s")
+                        format="%(asctime)s  %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S")
     return int(args.func(args) or 0)
 
 

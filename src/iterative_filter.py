@@ -1294,7 +1294,8 @@ def main(argv=None) -> None:
     p.add_argument("--no-figures", action="store_true", help="skip the figures")
     args = p.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S")
     cfg = load_config(args.config)
     if args.max_iter is not None:
         cfg["loop"]["max_iter"] = int(args.max_iter)
