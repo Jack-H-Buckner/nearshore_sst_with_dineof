@@ -567,28 +567,29 @@ def fit_seasonal(raw: F.Raw, offsets: dict, slope: dict, keep: dict, valid_inds:
     water = raw.water
     Y = comp["sst"][:, water].astype("float64")
     O = np.isfinite(Y)
-    H = int(sn["n_harmonics"])
+    H = 0 if sn.get("method") == "none" else int(sn["n_harmonics"])
     P = 1 + 2 * H
     X = design_matrix(pd.to_datetime(raw.times), H, float(sn["period_days"]))
-    coef, info = S.fit_harmonics_gappy(np.where(O, Y, 0.0), O, X,
-                                       min_dates=int(sn["min_dates"]),
-                                       max_cond=float(sn["max_cond"]))
-    R = np.where(O, Y - X @ coef, np.nan)
-    scale, _ = S.robust_scale(R, info["n_obs"], P, floor=float(sc["floor"]),
-                              dof_correction=bool(sc["dof_correction"]),
-                              fallback=sc["fallback"], fit_type=info["fit_type"])
+    coef, scale, _, fit_type, info = S.fit_seasonal_coeffs(
+        np.where(O, Y, 0.0), O, X, water, sn, sc)
 
     coef_g = np.full((P,) + water.shape, np.nan)
     coef_g[:, water] = coef
     scale_g = np.full(water.shape, np.nan)
     scale_g[water] = scale
     ft = np.full(water.shape, -1, dtype="int8")
-    ft[water] = info["fit_type"]
-    log.info("  seasonal: %d px full fit, %d mean-only, %d reference; median scale %.3f K",
-             int((info["fit_type"] == FIT_FULL).sum()), int((info["fit_type"] == 1).sum()),
-             int((info["fit_type"] == 0).sum()), float(np.median(scale)))
-    return dict(coef=coef_g, scale=scale_g, fit_type=ft, n_harmonics=H,
-                period_days=float(sn["period_days"]), comp=comp["sst"], src=comp["src"])
+    ft[water] = fit_type
+    mid = "borrowed" if sn.get("method") == "gmrf" else "mean-only"
+    log.info("  seasonal (%s): %d px full fit, %d %s, %d reference; median scale %.3f K",
+             sn.get("method", "harmonic"), int((fit_type == FIT_FULL).sum()),
+             int((fit_type == 1).sum()), mid, int((fit_type == 0).sum()), float(np.median(scale)))
+    out = dict(coef=coef_g, scale=scale_g, fit_type=ft, n_harmonics=H,
+               period_days=float(sn["period_days"]), comp=comp["sst"], src=comp["src"])
+    if sn.get("method") == "gmrf":                   # keep the raw LS coefficients for diagnostics
+        raw_g = np.full((P,) + water.shape, np.nan)
+        raw_g[:, water] = info["coef_raw"]
+        out["coef_raw"] = raw_g
+    return out
 
 
 def bootstrap(raw: F.Raw, keep: dict, cfg: dict, label: str,
@@ -852,6 +853,11 @@ def build_output(raw: F.Raw, inp: F.Inputs, loop_out: dict, fits: dict, fin: dic
         long_name="per-pixel robust residual scale (final fit)")
     put("sst_seasonal_fit_type", sea["fit_type"], ("y", "x"), units="1",
         flag_values="-1 0 1 2", flag_meanings="land reference mean_only full")
+    if "coef_raw" in sea:               # GMRF only: the per-pixel LS coefficients before smoothing
+        put("sst_seasonal_coef_raw", sea["coef_raw"].astype("float32"), ("term", "y", "x"),
+            units="K", n_harmonics=int(sea["n_harmonics"]),
+            period_days=float(sea["period_days"]),
+            long_name="per-pixel seasonal harmonic coefficients before GMRF smoothing")
     vmsk = np.zeros((len(raw.times),) + shape, dtype="int8")
     if fo["valid_inds"].size:
         comp_valid = fin["res"]["point_cv"]

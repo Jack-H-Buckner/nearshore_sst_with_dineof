@@ -7,6 +7,8 @@
   seasonal.png       the per-pixel seasonal climatology: mean and robust-scale maps, the
                      amplitude and phase of each harmonic, the fit method (full / mean-only /
                      reference) as a categorical map, and the reconstructed annual cycle.
+  seasonal_gmrf.png  (seasonal.method=gmrf only) raw vs GMRF-smoothed vs difference, for the
+                     mean and each harmonic amplitude -- the shrinkage / gap-fill map.
   cv_curves.png      the coarse CV search: point- and day-holdout RMSE against k, per T_c.
   cloud_filter_<id>.png
                      per pixel: share of observations removed and verdict flips across the
@@ -218,6 +220,65 @@ def seasonal_figure(ds: xr.Dataset, out: Path, dpi: int) -> None:
     plotting.save(fig, out)
 
 
+def seasonal_gmrf_figure(ds: xr.Dataset, out: Path, dpi: int) -> None:
+    """GMRF smoothing diagnostic: raw (per-pixel least-squares) vs smoothed vs their difference,
+    for the mean and each harmonic's amplitude. Only drawn when the raw coefficients were kept
+    (i.e. seasonal.method == 'gmrf'). The difference column is the shrinkage / gap-fill map: where
+    it is large, the GMRF moved thin-data pixels off their noisy own-fit toward their neighbours."""
+    raw = ds["sst_seasonal_coef_raw"].values              # (P, y, x), per-pixel LS (with fallback)
+    sm = ds["sst_seasonal_coef"].values                   # (P, y, x), GMRF-smoothed
+    H = int(ds["sst_seasonal_coef"].attrs.get("n_harmonics", (sm.shape[0] - 1) // 2))
+    period = float(ds["sst_seasonal_coef"].attrs.get("period_days", 365.25))
+    water = plotting.water_mask(ds)
+    extent = plotting.extent_km(ds)
+    fit = ds["sst_seasonal_fit_type"].values if "sst_seasonal_fit_type" in ds else None
+
+    # rows: mean, then one amplitude per harmonic. ("mean" [K], "harmonic k amplitude" [K])
+    def amp(c, k):
+        return c[0] if k == 0 else np.hypot(c[2 * k - 1], c[2 * k])
+    rows = [(0, "mean (c0) [K]")] + [(k, f"harmonic {k} amplitude [K]") for k in range(1, H + 1)]
+
+    nrows = len(rows)
+    fig = plt.figure(figsize=(13, 3.0 * nrows + 0.8), dpi=dpi, layout="constrained")
+    gs = fig.add_gridspec(nrows, 3)
+
+    def _draw(ax, data, cmap, vmin, vmax, title):
+        im = plotting.panel(ax, data, water, vmin=vmin, vmax=vmax, extent=extent, cmap=cmap)
+        ax.set_title(title, fontsize=8, color=INK)
+        ax.set_xticks([]); ax.set_yticks([])
+        fig.colorbar(im, ax=ax, shrink=0.82).ax.tick_params(labelsize=6)
+
+    seq = plt.get_cmap("magma")
+    div = plt.get_cmap("RdBu_r").copy(); div.set_bad(alpha=0.0)
+    moved = []
+    for r, (k, label) in enumerate(rows):
+        a_raw, a_sm = amp(raw, k), amp(sm, k)
+        both = np.concatenate([a_raw[water], a_sm[water]])
+        both = both[np.isfinite(both)]
+        lo, hi = (float(np.percentile(both, 1)), float(np.percentile(both, 99))) if both.size \
+            else (0.0, 1.0)
+        if lo == hi:
+            lo, hi = lo - 0.5, hi + 0.5
+        diff = a_sm - a_raw
+        dlim = float(np.nanpercentile(np.abs(diff[water]), 99)) if np.isfinite(diff[water]).any() \
+            else 1.0
+        dlim = max(dlim, 1e-6)
+        _draw(fig.add_subplot(gs[r, 0]), a_raw, seq, lo, hi, f"{label} — raw (per-pixel LS)")
+        _draw(fig.add_subplot(gs[r, 1]), a_sm, seq, lo, hi, f"{label} — GMRF smoothed")
+        _draw(fig.add_subplot(gs[r, 2]), diff, div, -dlim, dlim, f"{label} — smoothed − raw")
+        ad = np.abs(diff[water])
+        moved.append(float(np.nanpercentile(ad, 95)) if np.isfinite(ad).any() else float("nan"))
+
+    note = ""
+    if fit is not None:
+        n_borrow = int(((fit == 1) | (fit == 0)).sum())
+        note = f".  {n_borrow:,} pixels borrowed from neighbours"
+    fig.suptitle("GMRF seasonal smoothing: raw vs smoothed vs difference.  "
+                 f"95th-pct |Δ| per row: {', '.join(f'{m:.3g}' for m in moved)} K{note}",
+                 fontsize=9, color=INK, ha="left", x=0.01)
+    plotting.save(fig, out)
+
+
 def cv_figure(curve: pd.DataFrame, fit: dict, out: Path, dpi: int) -> None:
     """Point- and day-holdout RMSE against k, one line per T_c (sequential by T_c)."""
     tcs = sorted(curve["t_c"].unique())
@@ -386,6 +447,8 @@ def render(cube: Path, fig_dir: Path, rep_dir: Path | None = None, *, dpi: int =
 
     if "sst_seasonal_coef" in ds:
         seasonal_figure(ds, fig_dir / "seasonal.png", dpi)
+    if "sst_seasonal_coef_raw" in ds:
+        seasonal_gmrf_figure(ds, fig_dir / "seasonal_gmrf.png", dpi)
 
     if rep_dir is not None and (rep_dir / "cv_curve.csv").exists():
         cv_figure(pd.read_csv(rep_dir / "cv_curve.csv"),

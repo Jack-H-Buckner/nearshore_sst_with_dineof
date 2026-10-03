@@ -88,7 +88,15 @@ holdout:                      # high-res scenes held out for the point CV
   valid_pixels: 0.5
   seed: 0
 
-seasonal: {n_harmonics: 1, period_days: 365.25, min_dates: 10, max_cond: 100.0}
+# method: harmonic = per-pixel least squares (thin pixels fall back to one global cycle).
+# method: gmrf = spatially smoothed; thin/empty pixels borrow their cycle from neighbours via a
+#   Matern GMRF prior, with the prior SD estimated from the data (empirical Bayes). gmrf_range_px
+#   is the correlation range (pixels), gmrf_alpha 1=membrane / 2=thin-plate.
+# method: none = single grand mean subtracted from every pixel/date; DINEOF estimates the mean
+#   spatial pattern and any seasonal structure via its low-rank decomposition. n_harmonics is
+#   ignored in this mode.
+seasonal: {n_harmonics: 1, period_days: 365.25, min_dates: 10, max_cond: 100.0,
+           method: harmonic, gmrf_range_px: 50.0, gmrf_alpha: 2, gmrf_min_sd: 0.001}
 scale: {estimator: mad, floor: 0.5, dof_correction: true, fallback: median}
 
 dineof:

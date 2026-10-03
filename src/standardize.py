@@ -70,6 +70,7 @@ if str(_CMM_SRC) not in sys.path:
 from seasonal_smoothing import (                        # noqa: E402
     FIT_FULL, FIT_MEAN_ONLY, FIT_REFERENCE, amplitude_phase, design_matrix, term_names)
 
+import outlier_detection as OD                          # noqa: E402  (solve_spde, GMRF smoother)
 import standardize_figures                              # noqa: E402  (DINEOF's own src/)
 import plotting                                         # noqa: E402
 
@@ -96,6 +97,10 @@ DEFAULTS = {
         "period_days": 365.25,
         "min_dates": 10,
         "max_cond": 100.0,
+        "method": "harmonic",       # "harmonic" (per-pixel LS) | "gmrf" (spatially smoothed)
+        "gmrf_range_px": 50.0,      # correlation range of the coefficient-field prior, pixels
+        "gmrf_alpha": 2,            # 1 = membrane, 2 = thin-plate (passed to solve_spde)
+        "gmrf_min_sd": 1.0e-3,      # floor on the EB-estimated prior SD per coefficient channel
     },
     "scale": {
         "estimator": "mad",
@@ -120,6 +125,7 @@ DEFAULTS = {
 OPAQUE_SECTIONS = {"carry"}
 ESTIMATORS = ("mad", "none")
 FALLBACKS = ("median", "floor")
+SEASONAL_METHODS = ("harmonic", "gmrf")
 
 # Pixel-block size for the two nanmedian passes. The residual is (T, N) float64 = 162 MB at
 # full width; `np.nanmedian` copies and sorts, so it is taken in blocks.
@@ -169,6 +175,14 @@ def validate_seasonal(cfg: dict, path: Path) -> None:
             f"a {s['n_harmonics']}-harmonic fit needs; the system would be underdetermined")
     if float(s["max_cond"]) <= 1:
         raise ValueError(f"{path}: seasonal.max_cond must be > 1")
+    if s.get("method", "harmonic") not in SEASONAL_METHODS:
+        raise ValueError(f"{path}: seasonal.method must be one of {SEASONAL_METHODS}")
+    if float(s.get("gmrf_range_px", 50.0)) <= 0:
+        raise ValueError(f"{path}: seasonal.gmrf_range_px must be positive")
+    if int(s.get("gmrf_alpha", 2)) not in (1, 2):
+        raise ValueError(f"{path}: seasonal.gmrf_alpha must be 1 (membrane) or 2 (thin-plate)")
+    if float(s.get("gmrf_min_sd", 1.0e-3)) <= 0:
+        raise ValueError(f"{path}: seasonal.gmrf_min_sd must be positive")
 
 
 def validate_scale(cfg: dict, path: Path) -> None:
@@ -320,6 +334,147 @@ def robust_scale(R: np.ndarray, n_obs: np.ndarray, n_params: int, *, floor: floa
     return scale, mad
 
 
+def smooth_coefficients_gmrf(coef: np.ndarray, info: dict, scale0: np.ndarray,
+                             water: np.ndarray, X: np.ndarray, Y: np.ndarray, O: np.ndarray,
+                             s_cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Spatially smooth per-pixel harmonic coefficients with a GMRF/CAR prior (empirical Bayes).
+
+    This replaces the global-reference fallback of `fit_harmonics_gappy`. Instead of a thin or
+    empty pixel borrowing one basin-wide cycle, every coefficient is treated as a smooth spatial
+    field and estimated with a Matern GMRF (`outlier_detection.solve_spde`), so a pixel borrows
+    from its NEIGHBOURS, weighted by its own data precision. A FULL pixel with many observations
+    stays near its own least-squares value; a thin or empty one shrinks toward the locally
+    interpolated field. The prior marginal SD of each channel is estimated from the data by
+    method of moments (empirical Bayes), mirroring `composite.vc_weights`' tau2.
+
+    coef    (P, N)  least-squares coefficients from fit_harmonics_gappy; only FIT_FULL columns
+                    are trustworthy (A is singular/ill-conditioned elsewhere).
+    info    dict with "A" (N, P, P), "n_obs" (N,), "fit_type" (N,).
+    scale0  (N,)    an initial per-pixel residual scale, for the per-coefficient obs variance.
+    water   (y, x)  bool mask; N == water.sum().
+    X       (T, P)  harmonic design matrix. Y (T, N) values (0 off-obs), O (T, N) bool.
+    Returns (coef_s (P, N), fit_type_new (N,) int8 with the -1/0/1/2 codes).
+    """
+    P, N = coef.shape
+    A, n_obs = info["A"], info["n_obs"]
+    full = info["fit_type"] == FIT_FULL
+    range_px = float(s_cfg.get("gmrf_range_px", 50.0))
+    alpha = int(s_cfg.get("gmrf_alpha", 2))
+    min_sd = float(s_cfg.get("gmrf_min_sd", 1.0e-3))
+
+    # Per-coefficient estimation variance at the FULL pixels: diag(scale^2 * A^-1).
+    v = np.full((N, P), np.nan)
+    if full.any():
+        Ainv = np.linalg.inv(A[full])                       # (n_full, P, P)
+        v[full] = (scale0[full] ** 2)[:, None] * np.einsum("ipp->ip", Ainv)
+
+    wflat = np.flatnonzero(water.ravel())                   # column index -> grid cell
+
+    def to_grid(col: np.ndarray) -> np.ndarray:             # (N,) -> (y, x), NaN off-water
+        g = np.full(water.size, np.nan)
+        g[wflat] = col
+        return g.reshape(water.shape)
+
+    def from_grid(field: np.ndarray) -> np.ndarray:         # (y, x) -> (N,)
+        return field.reshape(-1)[wflat]
+
+    def eb_marg_sd(obs: np.ndarray, obs_var: np.ndarray, sel: np.ndarray) -> float:
+        """Method-of-moments prior SD: spatial variance minus mean estimation variance."""
+        if sel.sum() < 2:
+            return min_sd
+        var_spatial = float(np.var(obs[sel]))
+        mean_ev = float(np.nanmean(obs_var[sel]))
+        return float(np.sqrt(max(var_spatial - mean_ev, min_sd ** 2)))
+
+    coef_s = coef.copy()
+
+    # 1) Harmonic channels: smooth the FULL-pixel estimates; thin/empty pixels borrow neighbours.
+    for p in range(1, P):
+        obs = np.where(full, coef[p], np.nan)
+        obs_var = np.where(full, v[:, p], np.nan)
+        prior_mean = float(np.mean(coef[p, full])) if full.any() else 0.0
+        marg_sd = eb_marg_sd(coef[p], obs_var, full)
+        field, _ = OD.solve_spde(to_grid(obs), water, prior_mean, range_px, marg_sd,
+                                 to_grid(obs_var), alpha=alpha)
+        coef_s[p] = from_grid(field)
+
+    # 2) Mean channel, AFTER the cycle shape is known, so each pixel recenters to its own data
+    #    where it has any and borrows the mean only where it has none. This is the spatial
+    #    counterpart of the old MEAN_ONLY step, with a locally-smoothed shape in place of the
+    #    global cycle. The own-data de-cycled mean follows from the normal equations:
+    #    c0 = (b0 - A[0, 1:] . coef_s[1:]) / A[0, 0], with A[0, 0] = n_obs, b0 = sum of obs y.
+    has = n_obs >= 1
+    b0 = (np.asarray(O, float) * Y).sum(axis=0)             # (N,) sum of observed values
+    cross = np.einsum("np,pn->n", A[:, 0, 1:], coef_s[1:])  # (N,) A[0,1:] . coef_s[1:]
+    m_pix = np.full(N, np.nan)
+    m_pix[has] = (b0[has] - cross[has]) / np.maximum(n_obs[has], 1)
+    obs_var_mean = np.where(has, scale0 ** 2 / np.maximum(n_obs, 1), np.nan)
+    prior_mean0 = float(np.mean(m_pix[full])) if full.any() else 0.0
+    marg_sd0 = eb_marg_sd(m_pix, obs_var_mean, full)
+    field0, _ = OD.solve_spde(to_grid(m_pix), water, prior_mean0, range_px, marg_sd0,
+                              to_grid(obs_var_mean), alpha=alpha)
+    coef_s[0] = from_grid(field0)
+
+    fit_type = np.where(full, FIT_FULL, np.where(has, FIT_MEAN_ONLY, FIT_REFERENCE))
+    return coef_s, fit_type.astype(np.int8)
+
+
+def fit_seasonal_coeffs(Y: np.ndarray, O: np.ndarray, X: np.ndarray, water: np.ndarray,
+                        s_cfg: dict, sc_cfg: dict
+                        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Per-pixel seasonal coefficients, robust scale and fit_type, honouring `seasonal.method`.
+
+    Shared by both the standalone standardize path and pipeline.fit_seasonal so the two cannot
+    drift. `harmonic` is the original gappy least-squares fit with the global-reference fallback;
+    `gmrf` additionally smooths the coefficients spatially (`smooth_coefficients_gmrf`).
+    `none` subtracts a single grand mean (one scalar across all pixels and times) and lets
+    DINEOF estimate the mean spatial pattern and seasonal structure via its low-rank decomposition.
+
+    Y (T, N) values (0 off-obs), O (T, N) bool, X (T, P) design, water (y, x) bool.
+    Returns (coef (P, N), scale (N,), mad (N,), fit_type (N,), info) where `info` is the raw
+    fit_harmonics_gappy info (A / n_obs / original fit_type) for downstream diagnostics.
+    """
+    method = s_cfg.get("method", "harmonic")
+
+    if method == "none":
+        N = Y.shape[1]
+        grand_mean = float(np.nanmean(Y[O])) if O.any() else 0.0
+        coef = np.full((1, N), grand_mean)
+        n_obs = O.sum(axis=0).astype(float)
+        fit_type = np.full(N, FIT_FULL, dtype="int8")
+        info = {"n_obs": n_obs, "fit_type": fit_type, "coef_raw": coef.copy()}
+        if sc_cfg["estimator"] == "none":
+            scale = np.full(N, 1.0)
+            mad = np.full(N, np.nan)
+        else:
+            R = np.where(O, Y - grand_mean, np.nan)
+            scale, mad = robust_scale(R, n_obs, 1, floor=float(sc_cfg["floor"]),
+                                      dof_correction=bool(sc_cfg["dof_correction"]),
+                                      fallback=sc_cfg["fallback"], fit_type=fit_type)
+        return coef, scale, mad, fit_type, info
+
+    P = X.shape[1]
+    coef, info = fit_harmonics_gappy(Y, O, X, min_dates=int(s_cfg["min_dates"]),
+                                     max_cond=float(s_cfg["max_cond"]))
+    info["coef_raw"] = coef.copy()          # per-pixel LS coefficients, before any spatial smooth
+
+    def scale_and_mad(c: np.ndarray, ft: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if sc_cfg["estimator"] == "none":
+            return np.full(c.shape[1], 1.0), np.full(c.shape[1], np.nan)
+        R = np.where(O, Y - X @ c, np.nan)
+        return robust_scale(R, info["n_obs"], P, floor=float(sc_cfg["floor"]),
+                            dof_correction=bool(sc_cfg["dof_correction"]),
+                            fallback=sc_cfg["fallback"], fit_type=ft)
+
+    if method == "gmrf":
+        scale0, _ = scale_and_mad(coef, info["fit_type"])   # initial scale for the obs variance
+        coef, fit_type = smooth_coefficients_gmrf(coef, info, scale0, water, X, Y, O, s_cfg)
+    else:
+        fit_type = info["fit_type"]
+    scale, mad = scale_and_mad(coef, fit_type)
+    return coef, scale, mad, fit_type, info
+
+
 def roughness_over_se(coef: np.ndarray, A: np.ndarray, sd: np.ndarray, water: np.ndarray,
                       full: np.ndarray) -> dict:
     """Spatial roughness of each coefficient divided by its own standard error.
@@ -377,31 +532,19 @@ def standardize(ds: xr.Dataset, cfg: dict) -> dict:
              d["aoi"], N, len(times), int(O.sum()), 100 * O.sum() / O.size)
 
     X = design_matrix(times, H, float(s["period_days"]))        # (T, P)
-    coef, info = fit_harmonics_gappy(Y, O, X, min_dates=int(s["min_dates"]),
-                                     max_cond=float(s["max_cond"]))
-    counts = np.bincount(info["fit_type"], minlength=3)
-    log.info("fit types: %d full, %d mean-only, %d reference (no data)",
-             counts[FIT_FULL], counts[FIT_MEAN_ONLY], counts[FIT_REFERENCE])
+    coef, scale, mad, fit_type, info = fit_seasonal_coeffs(Y, O, X, water, s, sc)
+    counts = np.bincount(fit_type, minlength=3)
+    log.info("fit types (%s): %d full, %d %s, %d reference (no data)", s.get("method", "harmonic"),
+             counts[FIT_FULL], counts[FIT_MEAN_ONLY],
+             "borrowed" if s.get("method") == "gmrf" else "mean-only", counts[FIT_REFERENCE])
 
     seasonal = X @ coef                                         # (T, N)
     R = np.where(O, Y - seasonal, np.nan)
-
-    full = info["fit_type"] == FIT_FULL
-    if sc["estimator"] == "none":
-        scale = np.full(N, 1.0)
-        mad = np.full(N, np.nan)
-    else:
-        scale, mad = robust_scale(R, info["n_obs"], P, floor=float(sc["floor"]),
-                                  dof_correction=bool(sc["dof_correction"]),
-                                  fallback=sc["fallback"], fit_type=info["fit_type"])
+    full = info["fit_type"] == FIT_FULL                         # from the raw fit, for diagnostics
 
     Z = R / scale[None, :]
     z_obs = Z[O]
     mu = float(np.nanmean(z_obs))
-
-    # rescale masked channel
-    for k in ds.keys():
-        print(k)
 
     validation_msk = ds[d["validation_msk"]]
     field_msk = ds[d["channel_msk"]].values
@@ -410,14 +553,20 @@ def standardize(ds: xr.Dataset, cfg: dict) -> dict:
     R_msk = np.where(O, Y_msk - seasonal, np.nan)
     Z_msk = R_msk / scale[None, :]
 
-    # Each FIT_FULL pixel's least-squares residuals sum to exactly zero over its own observed
-    # entries, so the grand mean over all observed entries must be ~0 up to the fallback
-    # pixels. If it is not, the fit is wrong, and this is the cheapest place to find out.
-    if abs(mu) > 0.01:
-        raise ValueError(
-            f"mean standardized value over observed entries is {mu:+.4f}, expected ~0. The "
-            "per-pixel least-squares residuals should sum to zero by construction; this means "
-            "the design matrix, the mask, or the solve is inconsistent")
+    # For the per-pixel least-squares fit, each FIT_FULL pixel's residuals sum to exactly zero
+    # over its own observed entries, so the grand mean must be ~0. This is the cheapest place to
+    # catch an inconsistent design matrix / mask / solve. GMRF smoothing shrinks the coefficients
+    # and so does NOT preserve the exact zero-sum, so there the check is a loose warning only.
+    if s.get("method", "harmonic") == "harmonic":
+        if abs(mu) > 0.01:
+            raise ValueError(
+                f"mean standardized value over observed entries is {mu:+.4f}, expected ~0. The "
+                "per-pixel least-squares residuals should sum to zero by construction; this means "
+                "the design matrix, the mask, or the solve is inconsistent")
+    elif abs(mu) > 0.5:
+        log.warning("gmrf: mean standardized value over observed entries is %+.4f; spatial "
+                    "shrinkage does not preserve the exact per-pixel zero-sum, but a value this "
+                    "large still suggests a problem worth inspecting", mu)
 
     rough = roughness_over_se(coef, info["A"], scale, water, full)
     for j, name in enumerate(term_names(H)):
@@ -445,7 +594,8 @@ def standardize(ds: xr.Dataset, cfg: dict) -> dict:
         amp[k], peak[k] = a, p
 
     return dict(water=water, times=times, X=X, coef=coef, scale=scale, mad=mad,
-                Z=Z, Z_msk=Z_msk, msk=validation_msk,O=O, O3=O3, n_obs=info["n_obs"], fit_type=info["fit_type"],
+                Z=Z, Z_msk=Z_msk, msk=validation_msk, O=O, O3=O3, n_obs=info["n_obs"],
+                fit_type=fit_type,
                 amp=amp, peak=peak, rough=rough, mu=mu, P=P, H=H,
                 counts=dict(full=int(counts[FIT_FULL]), mean_only=int(counts[FIT_MEAN_ONLY]),
                             reference=int(counts[FIT_REFERENCE])))

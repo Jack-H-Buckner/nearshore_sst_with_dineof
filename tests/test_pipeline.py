@@ -346,3 +346,31 @@ def test_pipeline_segmented(tmp_path):
     result = xr.open_zarr(out["cube"])
     assert "sst_filled" in result
     assert np.isfinite(result["sst_filled"].values[:, truth["water"]]).all()
+
+
+def test_pipeline_gmrf_seasonal(tmp_path):
+    """Pipeline with seasonal.method='gmrf' completes and writes a valid seasonal climatology."""
+    src = tmp_path / "gmrf_source.zarr"
+    truth = SC.build(src)
+    cfg = P.build_config(
+        SC.pipeline_user_config(
+            src, tmp_path / "gmrf_out",
+            seasonal={"method": "gmrf", "gmrf_range_px": 8.0},
+        ),
+        resolve=False,
+    )
+    out = P.run_pipeline(cfg, tag="g", figures=False)
+    result = xr.open_zarr(out["cube"])
+    w = truth["water"]
+    for name in ("sst_filled", "sst_seasonal_coef", "sst_seasonal_sd", "sst_seasonal_fit_type",
+                 "sst_seasonal_coef_raw"):
+        assert name in result, name
+    assert np.isfinite(result["sst_filled"].values[:, w]).all()
+    # the seasonal fields are finite over water and fit_type uses the -1/0/1/2 codes
+    assert np.isfinite(result["sst_seasonal_coef"].values[:, w]).all()
+    assert np.isfinite(result["sst_seasonal_sd"].values[w]).all()
+    assert set(np.unique(result["sst_seasonal_fit_type"].values)).issubset({-1, 0, 1, 2})
+    # the GMRF diagnostic figure renders from the raw + smoothed coefficients
+    import pipeline_figures
+    pipeline_figures.seasonal_gmrf_figure(result, tmp_path / "seasonal_gmrf.png", 60)
+    assert (tmp_path / "seasonal_gmrf.png").exists()
