@@ -101,7 +101,12 @@ scale: {estimator: mad, floor: 0.5, dof_correction: true, fallback: median}
 
 dineof:
   matrix: {min_pixel_obs: 1, min_date_obs: 200, coarsen: 4}
-  filter: {t_c_grid: [0, [0.01, 3], 2, 4, 6, 8, 11], alpha_max: 0.25, stability_factor: 0.25}
+  # filter.t_c_grid tunes the TEMPORAL smoothing (cutoff period in days). l_c adds an optional
+  # SPATIAL smooth of the EOFs: each date's map is diffused over the water lattice before the SVD,
+  # denoising the spatial modes. l_c is a cutoff length in MATRIX (coarsened) pixels; 0 = off.
+  # Cost grows as l_c^2 (forward-Euler), so keep l_c <= ~10 for pixel-scale denoising.
+  filter: {t_c_grid: [0, [0.01, 3], 2, 4, 6, 8, 11], alpha_max: 0.25, stability_factor: 0.25,
+           l_c: 0.0, spatial_alpha_max: 0.25}
   modes: {k_grid: [1, 2, 3, 4, 5, 7, 9, 11, 15, 20, 25, 30, 40], rule: parsimonious,
           rel_tol: 0.01, patience: 3, sigma_convention: projection, fix_sign: true}
   em: {tol: 1.0e-3, max_iter: 250}

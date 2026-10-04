@@ -660,7 +660,7 @@ def final_fit(inp: F.Inputs, keep: dict, cfg: dict) -> dict:
     t0 = time.time()
     sel_c, _ = F.build_matrix(inp, keep, it)
     res_c = E.edineof(sel_c["X"], sel_c["observed"], sel_c["valid_msk"], sel_c["t"],
-                      it["_edineof"])
+                      it["_edineof"], geom=(sel_c["water"], sel_c["keep"]))
     log.info("coarse CV (%.0fs): point-opt k=%d T_c=%g, day-opt k=%d T_c=%g", time.time() - t0,
              res_c["k_opt"], res_c["tc_opt"], res_c["k_day"], res_c["tc_day"])
 
@@ -677,7 +677,7 @@ def final_fit(inp: F.Inputs, keep: dict, cfg: dict) -> dict:
     log.info("final fit: %d px x %d dates at coarsen %d, warm-started from coarsen %d",
              sel_f["m"], sel_f["n"], fc, int(sel_c["coarsen"]))
     res_f = E.edineof(sel_f["X"], sel_f["observed"], sel_f["valid_msk"], sel_f["t"],
-                      it_f["_edineof"], warm=warm)
+                      it_f["_edineof"], warm=warm, geom=(sel_f["water"], sel_f["keep"]))
     log.info("final fit done in %.0fs", time.time() - t1)
     return dict(res=res_f, sel=sel_f, res_c=res_c, sel_c=sel_c, cfg=it_f)
 
@@ -806,12 +806,13 @@ def build_output(raw: F.Raw, inp: F.Inputs, loop_out: dict, fits: dict, fin: dic
     # Each fit gets its own mode dimension: the point- and day-tuned fits can keep different
     # numbers of modes (k=2 and k=1 on Admiralty Inlet), and one shared `mode` cannot hold both.
     sel = fin["sel"]
+    l_c = float(fin["cfg"]["_edineof"]["filter"].get("l_c", 0.0))
     for suffix, fit in (("", smooth["fit"]), ("_point", fin["res"]["point_fit"])):
         md = f"mode{suffix}"
         U = to_native(modes_grid(fit["U"], sel), sel, shape)
         put(f"eof_U{suffix}", U, (md, "y", "x"), units="1",
             long_name="spatial EOF modes (unit-norm columns, standardized units)",
-            k=int(fit["k"]), cutoff_days=float(fit["t_c"]))
+            k=int(fit["k"]), cutoff_days=float(fit["t_c"]), spatial_cutoff_px=l_c)
         put(f"eof_sigma{suffix}", fit["sigma"].astype("float32"), (md,), units="1")
         put(f"eof_V{suffix}", fit["V"].T.astype("float32"), (md, "time"), units="1",
             long_name="temporal modes (orthonormal)")

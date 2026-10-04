@@ -254,3 +254,98 @@ def test_12_kernel_width_and_the_parity_ceiling():
     comb = E.filter_time(t, imp, 0.5, 10)               # exactly min(dt)^2 / 2
     assert np.abs(comb[101]) < 1e-15, "at alpha=1/2 every odd offset must vanish"
     assert comb[102] > 0.1, "...while even offsets carry all the weight"
+
+
+# ------------------------------------------------------- spatial EOF smoothing (filter.l_c)
+
+def _roughness(field, mask):
+    """Mean |cell - neighbour mean| over water cells: a scalar measure of spatial noise."""
+    deg = E._neighbour_sum(np.ones(mask.shape), mask)
+    nb = E._neighbour_sum(field, mask)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        local = np.where(deg > 0, nb / deg, field)
+    return float(np.abs((field - local)[mask]).mean())
+
+
+def test_filter_space_preserves_constant_and_conserves_mass():
+    """A constant water field is unchanged; the masked Laplacian conserves the water sum."""
+    H = W = 20
+    mask = np.ones((H, W), bool)
+    mask[:, :3] = False                                  # a land strip
+    const = np.where(mask, 5.0, 0.0)
+    out = E.filter_space(const, mask, alpha_s=0.25, p_s=10)
+    assert np.allclose(out[mask], 5.0)                   # constant preserved
+    assert np.all(out[~mask] == const[~mask])            # land untouched
+
+    rng = np.random.default_rng(0)
+    f = np.where(mask, rng.normal(size=(H, W)), 0.0)
+    sm = E.filter_space(f, mask, alpha_s=0.2, p_s=5)
+    assert np.isclose(sm[mask].sum(), f[mask].sum(), rtol=1e-10)   # water mass conserved
+    assert np.all(sm[~mask] == 0.0)                      # no leak onto land
+
+
+def test_filter_space_reduces_roughness_monotonically():
+    """More diffusion sweeps -> a strictly smoother field (lower neighbour roughness)."""
+    H = W = 24
+    mask = np.ones((H, W), bool)
+    rng = np.random.default_rng(1)
+    f = rng.normal(size=(H, W))
+    r = [_roughness(E.filter_space(f, mask, 0.2, p), mask) for p in (0, 1, 3, 8)]
+    assert r[0] > r[1] > r[2] > r[3]
+
+
+def test_spatial_settings_and_stability():
+    """l_c -> (alpha_s, p_s) with alpha_s under the ceiling; l_c=0 disables; ceiling enforced."""
+    assert E.spatial_settings(0.0, 0.25) == (0.0, 0)
+    assert E.spatial_settings(None, 0.25) == (0.0, 0)
+    for l_c in (3.0, 5.0, 10.0, 20.0):
+        alpha_s, p_s = E.spatial_settings(l_c, 0.25)
+        assert p_s >= 1 and alpha_s <= 0.25 + 1e-12
+        assert np.isclose(2 * np.pi * np.sqrt(alpha_s * p_s), l_c, rtol=1e-6)  # reach matches l_c
+    E.check_spatial_stability(0.25, 4, 0.25)             # on the ceiling: ok
+    with pytest.raises(ValueError, match="spatial_alpha_max"):
+        E.check_spatial_stability(0.4, 4, 0.25)
+
+
+def test_make_spatial_smoother_roundtrip_and_off():
+    """The smoother maps (m, K) -> (m, K) over the kept water pixels; l_c=0 returns None."""
+    H = W = 16
+    water = np.ones((H, W), bool)
+    water[:, :2] = False
+    keep = np.ones(int(water.sum()), bool)
+    keep[::7] = False                                    # drop a few water pixels from the matrix
+    m = int(keep.sum())
+    assert E.make_spatial_smoother(water, keep, 0.0, 0.25) is None
+    S = E.make_spatial_smoother(water, keep, 5.0, 0.25)
+    A = np.random.default_rng(2).normal(size=(m, 3))
+    out = S(A)
+    assert out.shape == (m, 3)
+    const = np.ones((m, 2))
+    assert np.allclose(S(const), 1.0, atol=1e-6)         # a constant mode stays constant
+
+
+def test_top_k_modes_smoother_denoises_U():
+    """With a smoother, the recovered leading spatial mode is less noisy, and the fit still tracks
+    the data: reconstruction RMSE at observed entries stays comparable."""
+    H = W = 20
+    water = np.ones((H, W), bool)
+    keep = np.ones(H * W, bool)
+    yy, xx = np.meshgrid(np.linspace(0, 1, H), np.linspace(0, 1, W), indexing="ij")
+    u0 = np.cos(np.pi * xx).ravel()                      # a smooth spatial pattern
+    u0 /= np.linalg.norm(u0)
+    t = uniform_t(30)
+    v0 = np.cos(2 * np.pi * t / 11)
+    rng = np.random.default_rng(3)
+    X = 10.0 * np.outer(u0, v0) + rng.normal(scale=0.5, size=(H * W, len(t)))  # mode + pixel noise
+
+    U0, s0, V0 = E.top_k_modes(X, 1, t, 0.0, 0, use_filter=False)
+    S = E.make_spatial_smoother(water, keep, 6.0, 0.25)
+    Us, ss, Vs = E.top_k_modes(X, 1, t, 0.0, 0, use_filter=False, smoother=S)
+
+    r_raw = _roughness(U0[:, 0].reshape(H, W), water)
+    r_sm = _roughness(Us[:, 0].reshape(H, W), water)
+    assert r_sm < 0.5 * r_raw, (r_sm, r_raw)            # the smoothed mode is markedly less rough
+    # the smoothed fit still explains the data about as well at observed entries
+    rec_raw = (U0 * s0) @ V0.T
+    rec_sm = (Us * ss) @ Vs.T
+    assert np.sqrt(((rec_sm - X) ** 2).mean()) < 1.2 * np.sqrt(((rec_raw - X) ** 2).mean())

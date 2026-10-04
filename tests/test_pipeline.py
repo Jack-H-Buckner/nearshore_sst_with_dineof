@@ -374,3 +374,34 @@ def test_pipeline_gmrf_seasonal(tmp_path):
     import pipeline_figures
     pipeline_figures.seasonal_gmrf_figure(result, tmp_path / "seasonal_gmrf.png", 60)
     assert (tmp_path / "seasonal_gmrf.png").exists()
+
+
+def test_pipeline_spatial_eof_smooth(tmp_path):
+    """Pipeline with dineof.filter.l_c > 0 (spatial EOF smoothing) completes with finite output,
+    and the written spatial modes are smoother than the l_c=0 run."""
+    src = tmp_path / "lc_source.zarr"
+    truth = SC.build(src)
+    w = truth["water"]
+
+    def run(l_c, tag):
+        cfg = P.build_config(SC.pipeline_user_config(src, tmp_path / f"out_{tag}"), resolve=False)
+        cfg["_iter"]["_edineof"]["filter"]["l_c"] = l_c
+        out = P.run_pipeline(cfg, tag=tag, figures=False)
+        return xr.open_zarr(out["cube"])
+
+    base = run(0.0, "lc0")
+    smooth = run(4.0, "lc4")
+    assert np.isfinite(smooth["sst_filled"].values[:, w]).all()
+    assert "eof_U" in smooth
+
+    # neighbour-roughness of the leading spatial mode should drop with smoothing: mean |difference|
+    # between horizontally/vertically adjacent water cells
+    def roughness(ds):
+        u = ds["eof_U"].values[0]                        # (y, x), NaN off water
+        diffs = []
+        for d in (np.diff(u, axis=0), np.diff(u, axis=1)):
+            d = np.abs(d[np.isfinite(d)])
+            diffs.append(d)
+        return float(np.concatenate(diffs).mean())
+
+    assert roughness(smooth) < roughness(base), (roughness(smooth), roughness(base))

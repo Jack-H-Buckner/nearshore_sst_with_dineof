@@ -35,6 +35,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
+import edineof as E
 import iterative_filter as F
 import pipeline as P
 import plotting
@@ -75,8 +76,11 @@ def holdout_predictions(out: dict, pcfg: dict) -> dict | None:
         return None
     ecfg = pcfg["_iter"]["_edineof"]
     s = {"t_c": float(res["tc_opt"]), "alpha": float(res["alpha_opt"]), "p": int(res["p_opt"])}
+    smoother = E.make_spatial_smoother(sel["water"], sel["keep"],
+                                       float(ecfg["filter"].get("l_c", 0.0)),
+                                       float(ecfg["filter"].get("spatial_alpha_max", 0.25)))
     fit = F.fit_fixed(sel["X"], sel["observed"] & ~held, sel["t"], int(res["k_opt"]), s, ecfg,
-                      label="cv-holdout")
+                      label="cv-holdout", smoother=smoother)
     sea = pcfg["seasonal"]
     seasonal = F.seasonal_field(out["raw"].times, sel["coef"], int(sea["n_harmonics"]),
                                 float(sea["period_days"]))

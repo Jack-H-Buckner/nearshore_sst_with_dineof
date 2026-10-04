@@ -680,13 +680,15 @@ def setting(t_c: float, ecfg: dict) -> dict:
 
 
 def fit_fixed(X_raw: np.ndarray, observed: np.ndarray, t: np.ndarray, k: int, s: dict,
-              ecfg: dict, seed: np.ndarray | None = None, label: str = "fixed") -> dict:
+              ecfg: dict, seed: np.ndarray | None = None, label: str = "fixed",
+              smoother=None) -> dict:
     """One eDINEOF fit at fixed (k, T_c): edineof's `final_fit`, without the search.
 
     Centre, fill, top_k_modes, reconstruct -- exactly as `final_fit` does, so with no seed and
     no CV holdout the two agree. `seed` is a previous analysis in (uncentred) z on this matrix;
     the gaps start from it rather than from the mean, which is the whole saving of a warm start:
     the EM iteration count is dominated by temporal diffusion into the gaps.
+    `smoother` (or None) is the optional spatial smoother applied to the data each EM iteration.
     """
     f, mo, em = ecfg["filter"], ecfg["modes"], ecfg["em"]
     E.check_stability(t, s["alpha"], s["p"], float(f["stability_factor"]))
@@ -705,9 +707,10 @@ def fit_fixed(X_raw: np.ndarray, observed: np.ndarray, t: np.ndarray, k: int, s:
             if empty.any():
                 X[:, empty] = 0.0
     X, hist = E.fill(X, gaps, int(k), t, s["alpha"], s["p"], float(em["tol"]),
-                     int(em["max_iter"]), sd, label=label)
+                     int(em["max_iter"]), sd, label=label, smoother=smoother)
     U, sigma, V = E.top_k_modes(X, int(k), t, s["alpha"], s["p"], use_filter=True,
-                                convention=mo["sigma_convention"], fix_sign=bool(mo["fix_sign"]))
+                                convention=mo["sigma_convention"], fix_sign=bool(mo["fix_sign"]),
+                                smoother=smoother)
     return dict(X=X + mu, lowrank=E.reconstruct(U, sigma, V) + mu, U=U, sigma=sigma, V=V, mu=mu,
                 hist=hist, k=int(k), t_c=s["t_c"], alpha=s["alpha"], p=s["p"])
 
@@ -888,9 +891,13 @@ def run_loop(inp: Inputs, cfg: dict, *, init_keep: dict | None = None,
     for it in range(int(lp["max_iter"])):
         t0 = time.time()
         sel, cstats = build_matrix(inp, keep, cfg)
+        geom = (sel["water"], sel["keep"])          # for the optional spatial EOF smoother
+        smoother = E.make_spatial_smoother(sel["water"], sel["keep"],
+                                           float(ecfg["filter"].get("l_c", 0.0)),
+                                           float(ecfg["filter"].get("spatial_alpha_max", 0.25)))
         rmse_point = rmse_day = np.nan
         if strategy == "every" or (strategy == "ends" and it == 0):
-            res = E.edineof(sel["X"], sel["observed"], sel["valid_msk"], sel["t"], ecfg)
+            res = E.edineof(sel["X"], sel["observed"], sel["valid_msk"], sel["t"], ecfg, geom=geom)
             fit = dict(res["day_fit"] if which == "day" else res["point_fit"], mu=res["mu"])
             rmse_point, rmse_day = cv_scores(res)
             if strategy == "ends":
@@ -901,7 +908,7 @@ def run_loop(inp: Inputs, cfg: dict, *, init_keep: dict | None = None,
         else:
             seed = from_grid(prev_grid, sel) if prev_grid is not None else None
             fit = fit_fixed(sel["X"], sel["observed"], sel["t"], chosen_k, fixed, ecfg,
-                            seed=seed, label=f"iter {it}")
+                            seed=seed, label=f"iter {it}", smoother=smoother)
         # Seed the next fit from the LOW-RANK field, not the analysis: at a fixed point the two
         # agree on the gaps, but at observed pixels the analysis holds the observation -- and a
         # pixel this iteration flags as cloud would then start the next fit at its cloudy value.
@@ -990,7 +997,8 @@ def run_loop(inp: Inputs, cfg: dict, *, init_keep: dict | None = None,
         # makes the CV RMSE comparable with the MODIS-baseline filter's own run.
         t0 = time.time()
         sel, _ = build_matrix(inp, keep, cfg)
-        final_res = E.edineof(sel["X"], sel["observed"], sel["valid_msk"], sel["t"], ecfg)
+        final_res = E.edineof(sel["X"], sel["observed"], sel["valid_msk"], sel["t"], ecfg,
+                              geom=(sel["water"], sel["keep"]))
         rp, rd = cv_scores(final_res)
         rows.append(dict(iter="final_cv", strategy=strategy, k=int(final_res["k_opt"]),
                          t_c=float(final_res["tc_opt"]), fit_seconds=time.time() - t0,
@@ -1204,8 +1212,11 @@ def downstream_skill(inp: Inputs, keep: dict, final_res: dict, st: xr.Dataset, c
     for name, (sel, k, s) in runs.items():
         hold = from_grid(common.astype("float32"), sel) > 0.5
         truth = sel["X"][hold]
+        smoother = E.make_spatial_smoother(sel["water"], sel["keep"],
+                                           float(ecfg["filter"].get("l_c", 0.0)),
+                                           float(ecfg["filter"].get("spatial_alpha_max", 0.25)))
         fit = fit_fixed(sel["X"], sel["observed"] & ~hold, sel["t"], k, s, ecfg,
-                        label=f"downstream/{name}")
+                        label=f"downstream/{name}", smoother=smoother)
         err = fit["X"][hold] - truth
         scl = np.broadcast_to(sel["scale"][sel["water"]][sel["keep"]][:, None], hold.shape)[hold]
         out[f"rmse_z_{name}"] = float(np.sqrt(np.mean(err ** 2)))

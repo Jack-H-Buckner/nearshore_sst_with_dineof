@@ -162,31 +162,136 @@ def filter_covariance(t: np.ndarray, B: np.ndarray, alpha: float, p: int) -> np.
     return (B + B.T) / 2.0
 
 
+# ==================================================================== spatial filter
+# The symmetric SPATIAL analog of the temporal filter above. filter_covariance smooths the data
+# along time (B~ = (XF)'(XF)); here we smooth each date's MAP in space (Xs = S X) before the
+# covariance, so the spatial modes U come from a denoised field. Same forward-Euler diffusion with
+# zero-flux (Neumann) edges -- but on the 2-D water lattice, coupling a pixel to its 4 water
+# neighbours, so flux across the coastline is zero and a constant is preserved.
+
+def _neighbour_sum(x: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Sum of the 4-connected neighbours over the grid's last two axes, edges to non-mask dropped.
+
+    The n-dimensional form of outlier_detection.neighbour_sum: `x` is (..., H, W), `mask` is
+    (H, W), vectorized over the leading axes so all modes/dates diffuse in one pass.
+    """
+    xm = np.where(mask, x, 0.0)
+    s = np.zeros_like(xm)
+    s[..., 1:, :] += xm[..., :-1, :]
+    s[..., :-1, :] += xm[..., 1:, :]
+    s[..., :, 1:] += xm[..., :, :-1]
+    s[..., :, :-1] += xm[..., :, 1:]
+    return s
+
+
+def filter_space(fields: np.ndarray, mask: np.ndarray, alpha_s: float, p_s: int) -> np.ndarray:
+    """p_s forward-Euler heat-diffusion sweeps of each 2-D field over the water lattice.
+
+    `fields` is (..., H, W); `mask` is (H, W) bool. Each sweep is M += alpha_s*(neighbours - deg*M),
+    the discrete Laplacian restricted to water, so a pixel only exchanges with its water neighbours
+    (zero flux at the coast/edge) and a constant is preserved. alpha_s <= 0.25 keeps it a proper
+    smoother (see check_spatial_stability). Vectorized over the leading axes.
+    """
+    if not alpha_s or not p_s:
+        return np.array(fields, dtype=float, copy=True)
+    mask = np.asarray(mask, bool)
+    n_nb = _neighbour_sum(np.ones(mask.shape), mask)         # (H, W) water-degree per cell
+    M = np.array(fields, dtype=float, copy=True)
+    for _ in range(int(p_s)):
+        lap = _neighbour_sum(M, mask) - n_nb * np.where(mask, M, 0.0)   # masked Laplacian
+        M = np.where(mask, M + alpha_s * lap, M)             # update water cells only
+    return M
+
+
+def spatial_settings(l_c: float, alpha_max: float) -> tuple[float, int]:
+    """Spatial cutoff length (pixels) -> (alpha_s, p_s), mirroring filter_settings for time.
+
+    Same algebra as the temporal filter: the smoothing reach is 2*pi*sqrt(alpha*p), so for a target
+    length `l_c` the cheapest pair is the largest alpha the stability limit allows and the smallest
+    integer p. l_c <= 0 (or None) disables the spatial filter.
+    """
+    if l_c is None or float(l_c) <= 0:
+        return 0.0, 0
+    ap = (float(l_c) / (2.0 * np.pi)) ** 2
+    p_s = max(1, int(np.ceil(ap / float(alpha_max))))
+    return ap / p_s, p_s
+
+
+def check_spatial_stability(alpha_s: float, p_s: int, alpha_max: float) -> None:
+    """Raise unless alpha_s <= alpha_max on the unit pixel grid (dx = 1). See check_stability."""
+    if not alpha_s or not p_s:
+        return
+    if alpha_s > float(alpha_max):
+        raise ValueError(
+            f"spatial alpha_s = {alpha_s:g} exceeds spatial_alpha_max = {alpha_max:g}. Above this "
+            "the 2-D diffusion stops being a smoother (the Nyquist mode oscillates instead of "
+            "decaying). Lower filter.l_c -- the reach 2*pi*sqrt(alpha_s*p_s) depends only on the "
+            "product, so a smaller l_c needs fewer sweeps too.")
+
+
+def make_spatial_smoother(water: np.ndarray, keep: np.ndarray, l_c: float, alpha_max: float):
+    """Build S: (m, K) -> (m, K) that diffuses each column over the matrix pixels' 2-D lattice.
+
+    `water` is the (H, W) mask at the matrix (possibly coarsened) resolution and `keep` (length
+    water.sum()) selects which water cells are matrix rows -- so the m rows map onto the subset of
+    water cells `water`&`keep`. Returns None when l_c disables smoothing (the identity path). The
+    diffusion runs only over the matrix pixels, so dropped/absent cells neither contribute nor leak.
+    """
+    alpha_s, p_s = spatial_settings(l_c, alpha_max)
+    if not p_s:
+        return None
+    check_spatial_stability(alpha_s, p_s, alpha_max)
+    water = np.asarray(water, bool)
+    smask = np.zeros(water.shape, bool)
+    smask[water] = np.asarray(keep, bool)                    # (H, W): cells that are matrix rows
+    wflat = np.flatnonzero(water.ravel())[np.asarray(keep, bool)]   # (m,) -> flat grid index
+    if p_s > 15:
+        log.warning("spatial filter: l_c=%g gives p_s=%d forward-Euler sweeps per fit (cost grows "
+                    "as l_c^2); expect ~%dx the per-fit cost. Consider a smaller l_c.",
+                    float(l_c), p_s, p_s)
+    log.info("spatial filter: l_c=%g px -> alpha_s=%.4g, p_s=%d (zero-flux at the coast)",
+             float(l_c), alpha_s, p_s)
+
+    def smoother(A: np.ndarray) -> np.ndarray:
+        K = A.shape[1]
+        g = np.zeros((K, water.size))
+        g[:, wflat] = A.T
+        g = filter_space(g.reshape(K, *water.shape), smask, alpha_s, p_s)
+        return g.reshape(K, water.size)[:, wflat].T
+    return smoother
+
+
 def top_k_modes(X: np.ndarray, k: int, t: np.ndarray, alpha: float, p: int,
-                use_filter: bool, *, convention: str = "projection", fix_sign: bool = True):
+                use_filter: bool, *, convention: str = "projection", fix_sign: bool = True,
+                smoother=None):
     """(U, sigma, V) for the leading k modes. Doc §4.
 
-    The temporal modes come from the FILTERED covariance; U comes from projecting the
-    UNFILTERED X onto them. The filter constrains when things happen, never what the spatial
-    patterns look like.
+    The temporal modes come from the FILTERED covariance; U comes from projecting X onto them.
+
+    `smoother`, when given, spatially smooths each date's map (Xs = S X) before the covariance --
+    the symmetric analog of the temporal filter, which smooths along time. Then B = Xs'Xs, V are its
+    temporal modes, and U = (Xs V)/||.|| are spatial modes of the DENOISED field. With smoother=None
+    this is the original fit exactly. The reconstruction U diag(sigma) V' is then spatially smooth,
+    so gaps fill with denoised patterns while observations stay pinned in the EM step.
 
     Dense `eigh` rather than `eigsh`: see the module docstring. It returns all n eigenpairs
     ascending, so take the last k and flip.
 
     Conventions (identical when the filter is off):
-      projection  sigma = ||X V||, so U diag(sigma) V' is exactly the orthogonal projection of
-                  X onto span(V). Least-squares optimal given the basis, and the default.
+      projection  sigma = ||Xs V||, so U diag(sigma) V' is exactly the orthogonal projection of
+                  Xs onto span(V). Least-squares optimal given the basis, and the default.
       reference   sigma = sqrt(lambda), what the Fortran does. Diffusion reduces variance, so
-                  sqrt(lambda) <= ||X V|| and mode amplitudes come out systematically damped.
+                  sqrt(lambda) <= ||Xs V|| and mode amplitudes come out systematically damped.
     """
-    B = X.T @ X
+    Xs = smoother(X) if smoother is not None else X     # (SX): spatial smoothing of the data
+    B = Xs.T @ Xs
     B = filter_covariance(t, B, alpha, p) if use_filter else (B + B.T) / 2.0
 
     lam, V = scipy.linalg.eigh(B)
     lam = np.maximum(lam[::-1][:k], 0.0)
     V = np.ascontiguousarray(V[:, ::-1][:, :k])
 
-    W = X @ V                                            # (m, k)
+    W = Xs @ V                                           # (m, k)
     norms = np.linalg.norm(W, axis=0)
     safe = np.where(norms > 0, norms, 1.0)
     U = W / safe
@@ -256,7 +361,7 @@ class Workspace:
 
 def fill(X: np.ndarray, gaps: np.ndarray, k: int, t: np.ndarray, alpha: float, p: int,
          tol: float, max_iter: int, sd: float, *, label: str = "",
-         work: Workspace | None = None) -> tuple[np.ndarray, dict]:
+         work: Workspace | None = None, smoother=None) -> tuple[np.ndarray, dict]:
     """EM at fixed k: fit modes, refill gaps, repeat until the filled values stop moving.
 
     Observed entries are held fixed and never updated -- there is no observation-error
@@ -275,7 +380,7 @@ def fill(X: np.ndarray, gaps: np.ndarray, k: int, t: np.ndarray, alpha: float, p
     norm = sd if sd > 0 else 1.0
     log_every = max(1, int(max_iter) // 10)
     for it in range(int(max_iter)):
-        U, sigma, V = top_k_modes(X, k, t, alpha, p, use_filter=True)
+        U, sigma, V = top_k_modes(X, k, t, alpha, p, use_filter=True, smoother=smoother)
         np.matmul(U, sigma[:, None] * V.T, out=R)
 
         # ||R - X||^2 restricted to the gaps, without ever forming a boolean selection:
@@ -542,11 +647,13 @@ def _fill_setting(
     hsp_w: float,
     dg_w: float,
     warm_seeds: dict | None,
+    smoother=None,
 ) -> list[dict]:
     """Run the k-loop for one filter setting; returns its grid-search rows.
 
     Each call allocates its own Workspace so workers can safely run concurrently.
     warm_seeds maps {t_c: seed_array} for the apply_seed logic (None = cold start).
+    `smoother` (or None) is the spatial smoother applied to the data each EM iteration.
     """
     alpha, p, tc = s["alpha"], s["p"], s["t_c"]
     X = X0.copy()
@@ -564,7 +671,7 @@ def _fill_setting(
         tk = time.time()
         np.copyto(work.prev, X)
         X, hist = fill(X, gaps, k, t, alpha, p, float(em["tol"]), int(em["max_iter"]),
-                       sd, label=f"T_c={tc:g}", work=work)
+                       sd, label=f"T_c={tc:g}", work=work, smoother=smoother)
         Xf = X.reshape(-1)
         e_hsp = _rms(Xf[hsp_idx], truth_hsp) if hsp_idx.size else float("nan")
         e_dg  = _rms(Xf[dg_idx],  truth_dg)  if dg_idx.size  else float("nan")
@@ -607,8 +714,13 @@ def _fill_setting(
 
 
 def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: np.ndarray, cfg: dict,
-            warm: dict | None = None) -> dict:
-    """The full algorithm, doc §7, with the k and p searches split across the two CV sets."""
+            warm: dict | None = None, geom: tuple | None = None) -> dict:
+    """The full algorithm, doc §7, with the k and p searches split across the two CV sets.
+
+    `geom`, when given, is `(water, keep)` -- the matrix-resolution water mask and the kept-pixel
+    selection -- enabling the optional spatial smoother (filter.l_c). Without it, or with l_c=0, the
+    spatial filter is off and the fit is unchanged.
+    """
     f, mo, em, c = cfg["filter"], cfg["modes"], cfg["em"], cfg["cv"]
     if warm:
         # No search: the settings are already chosen, at a resolution where searching was cheap.
@@ -617,6 +729,12 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
     settings = filter_settings(f["t_c_grid"], float(f["alpha_max"]))
     for s in settings:
         check_stability(t, s["alpha"], s["p"], float(f["stability_factor"]))
+
+    # Optional spatial smoother of the data (the spatial analog of the temporal t_c filter).
+    smoother = None
+    if geom is not None and float(f.get("l_c", 0.0)) > 0:
+        smoother = make_spatial_smoother(geom[0], geom[1], float(f["l_c"]),
+                                         float(f.get("spatial_alpha_max", 0.25)))
     log.info("filter grid: %s", ", ".join(
         f"T_c={s['t_c']:.3g}d (a={s['alpha']:.4g}, p={s['p']}"
         f"{', explicit' if s.get('explicit') else ''})" for s in settings))
@@ -668,7 +786,7 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
     call_args = (X0, gaps, ks, t, em, mo,
                  hsp_idx, dg_idx, day_idx,
                  truth_hsp, truth_dg, truth_day,
-                 sd, hsp_w, dg_w, warm_seeds)
+                 sd, hsp_w, dg_w, warm_seeds, smoother)
 
     rows: list[dict] = []
     if n_workers >= 2:
@@ -773,10 +891,10 @@ def edineof(X_raw: np.ndarray, observed: np.ndarray, valid_msk: np.ndarray, t: n
         Xf[dg_idx]  = truth_dg
         Xf[day_idx] = truth_day
         X, hist = fill(X, final_gaps, k, t, s["alpha"], s["p"], float(em["tol"]),
-                       int(em["max_iter"]), sd, label=label)
+                       int(em["max_iter"]), sd, label=label, smoother=smoother)
         U, sigma, V = top_k_modes(X, k, t, s["alpha"], s["p"], use_filter=True,
                                   convention=mo["sigma_convention"],
-                                  fix_sign=bool(mo["fix_sign"]))
+                                  fix_sign=bool(mo["fix_sign"]), smoother=smoother)
         # The rank-k model field itself, U diag(sigma) V', evaluated EVERYWHERE -- including at
         # pixels that were observed, where `X` holds the observation rather than the model's
         # own estimate of it. `X` is the analysis; this is what the basis alone says.
@@ -820,7 +938,9 @@ DEFAULTS = {
     "matrix": {"min_pixel_obs": 1, "min_date_obs": 200, "coarsen": 1,
                "warm_start_from": None, "n_workers": None},
     "filter": {"t_c_grid": [0, 2, 4, 6, 8, 11], "alpha_max": 0.25,
-               "stability_factor": 0.25},
+               "stability_factor": 0.25,
+               "l_c": 0.0,                   # spatial smoothing cutoff, MATRIX (coarsened) pixels; 0 = off
+               "spatial_alpha_max": 0.25},   # stability ceiling on alpha_s (unit pixel grid)
     "modes": {"k_grid": [1, 2, 3, 4, 5, 7, 9, 11, 15, 20, 25, 30, 40],
               "rule": "parsimonious", "rel_tol": 0.01,
               "patience": 3, "sigma_convention": "projection", "fix_sign": True},
@@ -887,6 +1007,10 @@ def validate(cfg: dict, path: Path) -> None:
         raise ValueError(f"{path}: filter.alpha_max must be in (0, 0.5]")
     if not 0 < float(f["stability_factor"]) <= 0.5:
         raise ValueError(f"{path}: filter.stability_factor must be in (0, 0.5]")
+    if float(f.get("l_c", 0.0)) < 0:
+        raise ValueError(f"{path}: filter.l_c must be >= 0 (0 = no spatial smoothing)")
+    if not 0 < float(f.get("spatial_alpha_max", 0.25)) <= 0.5:
+        raise ValueError(f"{path}: filter.spatial_alpha_max must be in (0, 0.5]")
     if mo["rule"] not in RULES:
         raise ValueError(f"{path}: modes.rule must be one of {RULES}")
     if mo["sigma_convention"] not in CONVENTIONS:
@@ -1402,7 +1526,8 @@ def main(argv=None) -> None:
     warm = None
     if cfg["matrix"]["warm_start_from"]:
         warm = load_warm_start(Path(cfg["matrix"]["warm_start_from"]), cfg, sel)
-    res = edineof(sel["X"], sel["observed"], sel["valid_msk"] , sel["t"], cfg, warm=warm)
+    res = edineof(sel["X"], sel["observed"], sel["valid_msk"], sel["t"], cfg, warm=warm,
+                  geom=(sel["water"], sel["keep"]))
     fields = {}
     for name, fit in (("day", res["day_fit"]), ("point", res["point_fit"])):
         if name == "point" and res["same_setting"]:

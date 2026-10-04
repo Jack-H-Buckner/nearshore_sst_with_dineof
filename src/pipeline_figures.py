@@ -109,6 +109,8 @@ def eof_figure(ds: xr.Dataset, suffix: str, out: Path, dpi: int) -> None:
     a = ds[f"eof_U{suffix}"].attrs
     title = (f"EOFs of the {'point-CV' if suffix else 'smooth-field'} fit: k={a.get('k')}, "
              f"T_c={a.get('cutoff_days')} d (standardized units)")
+    if float(a.get("spatial_cutoff_px", 0.0)) > 0:
+        title += f", spatial L_c={a.get('spatial_cutoff_px')} px"
     if status is not None and suffix == "":
         title += f".  Shaded: {int((status == 2).sum())} days no MODIS reached"
     fig.suptitle(title, fontsize=9, color=INK, ha="left", x=0.01)
