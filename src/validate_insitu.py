@@ -442,6 +442,62 @@ PRODUCT_COLORS = {"sst_filled": "#2a78d6", "sst_filled_point": "#1baf7a",
                   "sst_filled_day": "#eda100", "sst_smooth": "#eb6834",
                   "climatology": "#898781"}
 
+WATER_FILL = "#4a90d9"      # water: a readable mid blue
+STATION_FILL = "#e03131"    # the matched station pixel: red
+
+
+def station_pixel_map(ds: xr.Dataset, placed: pd.DataFrame, out: Path, dpi: int = 130) -> None:
+    """Map of the monitoring stations as highlighted pixels: land grey, water blue, each matched
+    station pixel red, labelled by station name. Shared by stage 3 and the standalone script.
+
+    `placed` is the station table from place_stations / cube_stations (station_name, row, col,
+    status). Stations that fell outside the grid or off water (row < 0) are listed in the title
+    but have no pixel to highlight.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patheffects as pe
+    from matplotlib.patches import Patch
+    import plotting
+    from cube_figures import INK, INK_SECONDARY
+
+    water = plotting.water_mask(ds)
+    extent = plotting.extent_km(ds)
+    xs, ys = ds["x"].values, ds["y"].values
+    km = lambda X, Y: ((X - xs.min()) / 1000.0, (Y - ys.min()) / 1000.0)  # noqa: E731
+
+    on = placed[placed["row"] >= 0]
+    station_mask = np.zeros(water.shape, bool)
+    for _, s in on.iterrows():
+        station_mask[int(s["row"]), int(s["col"])] = True
+
+    fig, ax = plt.subplots(figsize=(7.5, 7.5), dpi=dpi, layout="constrained")
+    ax.set_facecolor(plotting.NODATA_COLOR)
+    plotting.flat(ax, ~water, plotting.LAND_COLOR, extent)              # land grey
+    plotting.flat(ax, water & ~station_mask, WATER_FILL, extent)        # water blue
+    plotting.flat(ax, station_mask, STATION_FILL, extent)              # station pixels red
+
+    stroke = [pe.withStroke(linewidth=2.0, foreground="white")]
+    for _, s in on.iterrows():
+        cx, cy = km(xs[int(s["col"])], ys[int(s["row"])])
+        ax.plot(cx, cy, "o", color=STATION_FILL, markersize=4, markeredgecolor="white",
+                markeredgewidth=0.6, zorder=5)                          # keep the pixel visible
+        ax.annotate(str(s["station_name"]), (cx, cy), xytext=(6, 4), textcoords="offset points",
+                    fontsize=7, color=INK, zorder=6, path_effects=stroke)
+
+    n_off = int((placed["row"] < 0).sum())
+    ax.legend(handles=[Patch(color=plotting.LAND_COLOR, label="land"),
+                       Patch(color=WATER_FILL, label="water"),
+                       Patch(color=STATION_FILL, label="station pixel")],
+              fontsize=7, frameon=False, loc="upper right")
+    title = f"monitoring stations as matched pixels ({len(on)} on water"
+    title += f", {n_off} off-grid/land)" if n_off else ")"
+    ax.set_title(title, fontsize=9, color=INK)
+    ax.set_xlabel("km east", fontsize=7, color=INK_SECONDARY)
+    ax.set_ylabel("km north", fontsize=7, color=INK_SECONDARY)
+    plotting.save(fig, out)
+
 
 def figures(ds: xr.Dataset, mu: pd.DataFrame, placed: pd.DataFrame, met: pd.DataFrame,
             products: list[str], out_dir: Path, dpi: int) -> None:
@@ -485,6 +541,9 @@ def figures(ds: xr.Dataset, mu: pd.DataFrame, placed: pd.DataFrame, met: pd.Data
     ax.set_xlabel("km east", fontsize=7)
     ax.set_ylabel("km north", fontsize=7)
     plotting.save(fig, out_dir / "stations_map.png")
+
+    # station pixels highlighted over the land/water mask, labelled by name
+    station_pixel_map(ds, placed, out_dir / "station_pixels.png", dpi)
 
     if mu.empty:
         return

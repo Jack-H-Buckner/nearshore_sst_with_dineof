@@ -226,7 +226,7 @@ def test_validate_writes_outputs(cube, tmp_path):
         .to_csv(csv, index=False)
     out = V.validate(cube, csv, V.load_config(None), tmp_path / "val", figs=True)
     for f in ("matchups.csv", "metrics.csv", "stations.csv", "stations_map.png",
-              "scatter.png", "error_by_category.png", "timeseries_A.png"):
+              "station_pixels.png", "scatter.png", "error_by_category.png", "timeseries_A.png"):
         assert (tmp_path / "val" / f).exists(), f
     m = out["metrics"]
     allrow = m[(m["match"] == "overpass") & (m["product"] == "sst_filled") &
