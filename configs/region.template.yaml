@@ -140,4 +140,7 @@ output:
 validation:
   insitu: null                # netCDF / CSV path, or null to use the cube's insitu_* channels
   products: [sst_filled, sst_filled_point, sst_filled_day, sst_smooth]
-  match: {max_dt_min: 60.0, min_coverage: 0.75, max_snap_m: 300.0}
+  # box_sizes: also validate against the mean of a box of pixels around each station, to gauge how
+  # sensitive the metrics are to single-pixel sampling. Pixel counts (odd perfect squares); 1 = the
+  # single station pixel. e.g. [1, 9, 25, 49]. Land/invalid box pixels are dropped before averaging.
+  match: {max_dt_min: 60.0, min_coverage: 0.75, max_snap_m: 300.0, box_sizes: [1]}

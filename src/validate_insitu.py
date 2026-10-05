@@ -58,6 +58,10 @@ DEFAULTS = {
         "max_snap_m": 300.0,        # a land-pixel station moves to water within this, or drops
         "hour_var": "modis_hour_aqua",
         "default_hour": None,       # UTC hour when the cube has no hour channel at all
+        # Also validate against the mean of a box of pixels around each station, to gauge how
+        # sensitive the metrics are to single-pixel sampling. Pixel counts (odd perfect squares);
+        # 1 = the single station pixel. e.g. [1, 9, 25, 49]. Land/invalid box pixels are dropped.
+        "box_sizes": [1],
     },
     "insitu": {
         "format": "auto",           # auto | netcdf | csv
@@ -297,8 +301,39 @@ def match_daily_mean(obs: pd.DataFrame, days: pd.DatetimeIndex,
 
 # ==================================================================== sampling
 
-def sample_products(ds: xr.Dataset, placed: pd.DataFrame, products: list[str]) -> dict:
-    """name -> (T, n_station) values at the station pixels (degC for SST; flags as-is)."""
+def _box_halfwidth(n: int) -> int:
+    """Box pixel count (odd perfect square) -> half-width w, so the box is (2w+1)^2 = n."""
+    w = (int(round(float(n) ** 0.5)) - 1) // 2
+    if int(n) < 1 or (2 * w + 1) ** 2 != int(n):
+        raise ValueError(f"match.box_sizes entry {n} is not an odd perfect square "
+                         "(use 1, 9, 25, 49, 81, ...)")
+    return w
+
+
+def _box_means(field: np.ndarray, water: np.ndarray, rows: np.ndarray, cols: np.ndarray,
+               w: int) -> np.ndarray:
+    """(T, n_station) mean of `field` over the (2w+1)^2 box around each (row, col), using only
+    water+finite pixels (land/invalid dropped). All-land/all-NaN boxes give NaN."""
+    T = field.shape[0]
+    H, W = water.shape
+    out = np.full((T, len(rows)), np.nan)
+    for k, (r, c) in enumerate(zip(rows, cols)):
+        r0, r1 = max(0, r - w), min(H, r + w + 1)
+        c0, c1 = max(0, c - w), min(W, c + w + 1)
+        fbox = field[:, r0:r1, c0:c1]                                     # (T, wy, wx)
+        m = (water[r0:r1, c0:c1][None] & np.isfinite(fbox)).reshape(T, -1)  # water + finite
+        tot = np.where(m, fbox.reshape(T, -1), 0.0).sum(axis=1)
+        cnt = m.sum(axis=1)
+        out[:, k] = np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan)   # all-land box -> NaN
+    return out
+
+
+def sample_products(ds: xr.Dataset, placed: pd.DataFrame, products: list[str],
+                    box_sizes: list[int] | None = None) -> dict:
+    """name -> (T, n_station) values at the station pixels (degC for SST; flags as-is).
+
+    For each box size N > 1 in `box_sizes`, also returns `f"{p}_box{N}"`: the mean of product p
+    over the (2w+1)^2 box of water pixels around each station, land/invalid dropped."""
     ok = placed[placed["row"] >= 0]
     iy = xr.DataArray(ok["row"].to_numpy(), dims="station")
     ix = xr.DataArray(ok["col"].to_numpy(), dims="station")
@@ -315,6 +350,20 @@ def sample_products(ds: xr.Dataset, placed: pd.DataFrame, products: list[str]) -
     out["climatology"] = X @ coef - 273.15
     if "sst_filled_observed" in ds:
         out["_observed"] = ds["sst_filled_observed"].isel(y=iy, x=ix).values.astype(bool)
+
+    sizes = [int(n) for n in (box_sizes or []) if int(n) > 1]
+    if sizes:
+        water = np.asarray(ds["landcover_water"].values > 0.5)
+        rows, cols = ok["row"].to_numpy(), ok["col"].to_numpy()
+        boxed = [p for p in products if p in ds]
+        fields = {p: ds[p].values.astype(float) - 273.15 for p in boxed}
+        # Per-pixel climatology over the whole grid: design_matrix @ coef (land coef dropped below).
+        clim_full = np.tensordot(X, ds["sst_seasonal_coef"].values, axes=(1, 0)) - 273.15
+        fields["climatology"] = clim_full
+        for n in sizes:
+            w = _box_halfwidth(n)
+            for p, field in fields.items():
+                out[f"{p}_box{n}"] = _box_means(field, water, rows, cols, w)
     return out
 
 
@@ -356,11 +405,13 @@ def build_matchups(ds: xr.Dataset, cfg: dict, insitu: pd.DataFrame | None) -> tu
             dm[:, k], cov[:, k] = match_daily_mean(o, days, cfg["match"]["min_coverage"])
         values = {"overpass": (ov, ovdt), "daily_mean": (dm, cov)}
 
-    empty = pd.DataFrame(columns=MATCHUP_COLS + products + ["climatology"])
+    box_sizes = [int(n) for n in cfg["match"].get("box_sizes", [1])]
+    box_cols = [f"{p}_box{n}" for n in box_sizes if n > 1 for p in products + ["climatology"]]
+    empty = pd.DataFrame(columns=MATCHUP_COLS + products + ["climatology"] + box_cols)
     ok = placed[placed["row"] >= 0].reset_index(drop=True)
     if ok.empty:
         return empty, placed
-    samp = sample_products(ds, ok, products)
+    samp = sample_products(ds, ok, products, box_sizes=box_sizes)
     constrained = (ds["sst_filled_constrained"].values.astype(bool)
                    if "sst_filled_constrained" in ds else np.ones(len(days), bool))
     status = (ds["smooth_loading_status"].values if "smooth_loading_status" in ds
@@ -383,7 +434,7 @@ def build_matchups(ds: xr.Dataset, cfg: dict, insitu: pd.DataFrame | None) -> tu
                          loading_status=int(status[j]),
                          seasonal_fit=_seasonal_fit_label(ftype, int(s["row"]), int(s["col"])),
                          season=SEASONS[days[j].month])
-                for p in products + ["climatology"]:
+                for p in products + ["climatology"] + box_cols:
                     if p in samp:
                         r[p] = float(samp[p][j, k])
                 rows.append(r)
@@ -478,11 +529,11 @@ def station_pixel_map(ds: xr.Dataset, placed: pd.DataFrame, out: Path, dpi: int 
     plotting.flat(ax, water & ~station_mask, WATER_FILL, extent)        # water blue
     plotting.flat(ax, station_mask, STATION_FILL, extent)              # station pixels red
 
+    # The station IS the single red pixel above -- no marker, so the figure keeps pixel-level
+    # precision (the cell is small by design). Only the name label points at it.
     stroke = [pe.withStroke(linewidth=2.0, foreground="white")]
     for _, s in on.iterrows():
         cx, cy = km(xs[int(s["col"])], ys[int(s["row"])])
-        ax.plot(cx, cy, "o", color=STATION_FILL, markersize=4, markeredgecolor="white",
-                markeredgewidth=0.6, zorder=5)                          # keep the pixel visible
         ax.annotate(str(s["station_name"]), (cx, cy), xytext=(6, 4), textcoords="offset points",
                     fontsize=7, color=INK, zorder=6, path_effects=stroke)
 
@@ -500,7 +551,8 @@ def station_pixel_map(ds: xr.Dataset, placed: pd.DataFrame, out: Path, dpi: int 
 
 
 def figures(ds: xr.Dataset, mu: pd.DataFrame, placed: pd.DataFrame, met: pd.DataFrame,
-            products: list[str], out_dir: Path, dpi: int) -> None:
+            products: list[str], out_dir: Path, dpi: int,
+            box_sizes: list[int] | None = None) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -622,6 +674,33 @@ def figures(ds: xr.Dataset, mu: pd.DataFrame, placed: pd.DataFrame, met: pd.Data
     ax.set_title(f"error by gap category ({match} match)", fontsize=9, color=INK)
     plotting.save(fig, out_dir / "error_by_category.png")
 
+    # sensitivity to single-pixel sampling: RMSE and bias vs box size, one line per product
+    sizes = sorted(int(n) for n in (box_sizes or [1]))
+    if len(sizes) > 1:
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.4), dpi=dpi, layout="constrained")
+        for p in ps:
+            for ax, stat in ((axes[0], "rmse"), (axes[1], "bias")):
+                ys = []
+                for n in sizes:
+                    prod = p if n == 1 else f"{p}_box{n}"
+                    m = met[(met["match"] == match) & (met["product"] == prod) &
+                            (met["stratum"] == "all")]
+                    ys.append(float(m[stat].iloc[0]) if len(m) else np.nan)
+                ax.plot(sizes, ys, "o-", color=PRODUCT_COLORS.get(p, "#2a78d6"), linewidth=2,
+                        markersize=5, label=p)
+        for ax, stat, lab in ((axes[0], "rmse", "RMSE [K]"), (axes[1], "bias", "bias [K]")):
+            style(ax)
+            ax.set_xscale("log")
+            ax.set_xticks(sizes, [str(n) for n in sizes])
+            ax.set_xlabel("box size (pixels averaged)", fontsize=8)
+            ax.set_ylabel(f"{lab} vs in situ", fontsize=8)
+            ax.set_title(stat, fontsize=9, color=INK)
+        axes[1].axhline(0, color="#898781", linewidth=1, linestyle="--")
+        axes[0].legend(fontsize=7, frameon=False, ncol=2)
+        fig.suptitle(f"validation sensitivity to box averaging ({match} match)",
+                     fontsize=9, color=INK, ha="left", x=0.01)
+        plotting.save(fig, out_dir / "box_sensitivity.png")
+
 
 # ==================================================================== driver
 
@@ -631,7 +710,11 @@ def validate(cube: Path, insitu_path: Path | None, cfg: dict, out_dir: Path,
     insitu = read_insitu(insitu_path, cfg) if insitu_path is not None else None
     mu, placed = build_matchups(ds, cfg, insitu)
     products = [p for p in cfg["products"] if p in ds]
-    met = metrics(mu, products)
+    box_sizes = [int(n) for n in cfg["match"].get("box_sizes", [1])]
+    # box columns are not cube variables, so build their names explicitly (the `if p in ds`
+    # filter above would drop them) and hand them to metrics as extra products.
+    box_products = [f"{p}_box{n}" for n in box_sizes if n > 1 for p in products + ["climatology"]]
+    met = metrics(mu, products + box_products)
     out_dir.mkdir(parents=True, exist_ok=True)
     mu.to_csv(out_dir / "matchups.csv", index=False)
     met.to_csv(out_dir / "metrics.csv", index=False)
@@ -646,7 +729,8 @@ def validate(cube: Path, insitu_path: Path | None, cfg: dict, out_dir: Path,
              out_dir / "stations.csv")
     if figs:
         try:
-            figures(ds, mu, placed, met, products, out_dir, int(cfg["output"]["dpi"]))
+            figures(ds, mu, placed, met, products, out_dir, int(cfg["output"]["dpi"]),
+                    box_sizes=box_sizes)
         except Exception:
             log.exception("figures failed; the CSVs were written and are intact")
     return dict(matchups=mu, metrics=met, stations=placed)

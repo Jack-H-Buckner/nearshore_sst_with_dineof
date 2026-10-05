@@ -232,3 +232,65 @@ def test_validate_writes_outputs(cube, tmp_path):
     allrow = m[(m["match"] == "overpass") & (m["product"] == "sst_filled") &
                (m["stratum"] == "all")].iloc[0]
     assert allrow["rmse"] == pytest.approx(0.0, abs=1e-4)
+
+
+# ------------------------------------------------------------ box-averaged validation
+
+def test_box_halfwidth():
+    assert (V._box_halfwidth(1), V._box_halfwidth(9), V._box_halfwidth(25),
+            V._box_halfwidth(49)) == (0, 1, 2, 3)
+    for bad in (10, 4, 0, 16):          # non-odd-perfect-squares (16=4x4 is even side)
+        with pytest.raises(ValueError, match="odd perfect square"):
+            V._box_halfwidth(bad)
+
+
+def test_box_means_drops_land_and_all_land_is_nan():
+    """The box mean uses only water + finite pixels; an all-land box is NaN."""
+    H = Wd = 6
+    water = np.ones((H, Wd), bool)
+    water[:, 0] = False                                  # a land column
+    field = np.empty((1, H, Wd))
+    for r in range(H):
+        for c in range(Wd):
+            field[0, r, c] = r * 10 + c
+    # station at (2, 1), 3x3 box rows 1-3 cols 0-2; col 0 is land -> cols 1,2 x rows 1,2,3
+    got = V._box_means(field, water, np.array([2]), np.array([1]), w=1)
+    want = np.mean([11, 12, 21, 22, 31, 32])
+    assert got.shape == (1, 1)
+    assert got[0, 0] == pytest.approx(want)
+    # a box entirely on land -> NaN
+    land_only = np.zeros((H, Wd), bool)
+    g2 = V._box_means(field, land_only, np.array([2]), np.array([1]), w=1)
+    assert np.isnan(g2[0, 0])
+
+
+def test_build_matchups_box_columns(cube):
+    """A near-shore station's 3x3 box drops the land column and averages the water pixels; the
+    box columns appear for every product and climatology."""
+    obs = station_obs("A", 10, 3)                        # col 3 = first water column (cols 0-2 land)
+    mu, placed = run(cube, obs, box_sizes=[1, 9, 25])
+    for col in ("sst_filled_box9", "sst_filled_box25", "climatology_box9"):
+        assert col in mu.columns, col
+    ov = mu[mu["match"] == "overpass"].sort_values("t")
+    j = int(ov["t"].iloc[0])
+    # expected 3x3 box mean of `field` at (10,3): rows 9-11, cols 2-4, col 2 dropped (land)
+    rs, cs = [9, 10, 11], [3, 4]
+    want = np.mean([field(j, r, c) for r in rs for c in cs]) - 273.15
+    assert ov["sst_filled_box9"].iloc[0] == pytest.approx(want, abs=1e-4)
+    # it genuinely differs from the single-pixel value (the whole point of the check)
+    assert abs(ov["sst_filled"].iloc[0] - ov["sst_filled_box9"].iloc[0]) > 1e-3
+
+
+def test_validate_box_sizes_outputs(cube, tmp_path):
+    """validate() with box_sizes>1 writes the box metrics rows and the sensitivity figure."""
+    obs = station_obs("A", 10, 20, hours=np.arange(0, 24, 1.0))
+    csv = tmp_path / "obs.csv"
+    obs.rename(columns={"lat": "latitude", "lon": "longitude", "value_C": "value"}) \
+        .to_csv(csv, index=False)
+    cfg = V.load_config(None)
+    cfg["match"]["box_sizes"] = [1, 9, 25]
+    out = V.validate(cube, csv, cfg, tmp_path / "val", figs=True)
+    assert (tmp_path / "val" / "box_sensitivity.png").exists()
+    m = out["metrics"]
+    assert ((m["product"] == "sst_filled_box9") & (m["stratum"] == "all")).any()
+    assert ((m["product"] == "sst_filled_box25") & (m["stratum"] == "all")).any()
