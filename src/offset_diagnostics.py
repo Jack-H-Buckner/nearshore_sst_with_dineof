@@ -402,26 +402,39 @@ def outliers_figure(pairs: pd.DataFrame, info: dict, k: float, label: str, out: 
 
 
 def outlier_maps_figure(pairs: pd.DataFrame, raw: F.Raw, mem: np.ndarray, label: str,
-                        extent, out: Path, dpi: int, n_scenes: int = 4) -> None:
+                        extent, out: Path, dpi: int, n_scenes: int = 4,
+                        aggregate: str = "footprint") -> None:
     rem = pairs.groupby("t")["kept"].apply(lambda v: int((~v).sum()))
     pick = rem.sort_values(ascending=False).head(n_scenes).index.tolist()
     if not pick:
         return
     water = raw.water
+    med = float(np.median(pairs["resid"]))
     fig, axes = plt.subplots(len(pick), 3, figsize=(13, 4.0 * len(pick)), dpi=dpi,
                              layout="constrained", squeeze=False)
     div = plt.get_cmap("RdBu_r").copy()
     div.set_bad(alpha=0.0)
     for row, t in zip(axes, pick):
         g = pairs[pairs["t"] == t]
-        labels = P.modis_footprints(raw.ref[t])
-        lut_r = np.full(labels.max() + 1, np.nan)
-        lut_k = np.zeros(labels.max() + 1, bool)
-        lut_r[g["fp"].to_numpy(int)] = g["resid"].to_numpy(float) - np.median(pairs["resid"])
-        lut_k[g["fp"].to_numpy(int)] = ~g["kept"].to_numpy(bool)
-        res_map = lut_r[labels]
-        res_map[labels == 0] = np.nan
-        rem_map = lut_k[labels] & (labels > 0)
+        fp = g["fp"].to_numpy(int)
+        if aggregate == "pixel":
+            # fp is the flat cell index into the (y, x) grid; paint each pixel directly.
+            res_flat = np.full(water.size, np.nan)
+            rem_flat = np.zeros(water.size, bool)
+            res_flat[fp] = g["resid"].to_numpy(float) - med
+            rem_flat[fp] = ~g["kept"].to_numpy(bool)
+            res_map = res_flat.reshape(water.shape)
+            rem_map = rem_flat.reshape(water.shape) & water
+        else:
+            # fp is a footprint label; paint the whole footprint patch (modis_footprints).
+            labels = P.modis_footprints(raw.ref[t])
+            lut_r = np.full(labels.max() + 1, np.nan)
+            lut_k = np.zeros(labels.max() + 1, bool)
+            lut_r[fp] = g["resid"].to_numpy(float) - med
+            lut_k[fp] = ~g["kept"].to_numpy(bool)
+            res_map = lut_r[labels]
+            res_map[labels == 0] = np.nan
+            rem_map = lut_k[labels] & (labels > 0)
         sen = mem[t] - 273.15
         mod = raw.ref[t] - 273.15
         vals = np.r_[sen[np.isfinite(sen)], mod[np.isfinite(mod)]]
@@ -429,12 +442,14 @@ def outlier_maps_figure(pairs: pd.DataFrame, raw: F.Raw, mem: np.ndarray, label:
         im = plotting.panel(row[0], sen, water, vmin=lo, vmax=hi, extent=extent)
         row[0].set_title(f"{g['date'].iloc[0]}  {label} (kept pixels)", fontsize=8, color=INK)
         plotting.panel(row[1], mod, water, vmin=lo, vmax=hi, extent=extent)
-        row[1].set_title("MODIS footprints", fontsize=8, color=INK)
+        row[1].set_title("MODIS" if aggregate == "pixel" else "MODIS footprints",
+                         fontsize=8, color=INK)
         fig.colorbar(im, ax=row[:2], shrink=0.8, label="SST [degC]").ax.tick_params(labelsize=6)
         rl = float(np.nanpercentile(np.abs(res_map), 98)) if np.isfinite(res_map).any() else 1
         imr = plotting.panel(row[2], res_map, water, vmin=-rl, vmax=rl, extent=extent, cmap=div)
         plotting.flat(row[2], rem_map, REMOVED, extent)
-        row[2].set_title(f"footprint residual; orange = removed "
+        unit = "pixel" if aggregate == "pixel" else "footprint"
+        row[2].set_title(f"{unit} residual; orange = removed "
                          f"({int((~g['kept']).sum())} of {len(g)})", fontsize=8, color=INK)
         fig.colorbar(imr, ax=row[2], shrink=0.8, label="K").ax.tick_params(labelsize=6)
         for ax in row:

@@ -363,7 +363,8 @@ def run(rc: dict, *, tag: str | None = None, masks: Path | None = None,
             D.outliers_figure(r["pairs"], r["clip"], k, labels[sid],
                               fig_dir / f"outliers_{sid}.png", dpi)
             D.outlier_maps_figure(r["pairs"], raw, r["mem"], labels[sid], extent,
-                                  fig_dir / f"outlier_maps_{sid}.png", dpi)
+                                  fig_dir / f"outlier_maps_{sid}.png", dpi,
+                                  aggregate=rc["pipe"]["matchup"]["aggregate"])
         summary_figure(results, labels, float(rc["offsets"]["recommend_min_gain"]),
                        fig_dir / "summary.png", dpi)
     log.info("stage 1 done in %.1f min -> %s", (time.time() - t0) / 60, out)
