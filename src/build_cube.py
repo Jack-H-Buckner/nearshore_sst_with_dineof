@@ -127,7 +127,7 @@ SENSOR_DEFAULTS = {
 
 # Scalar keys `detector` carries in addition to simple_outlier_detection's own sections.
 DETECTOR_SCALARS = {"ref_var", "tidal_depth_m"}
-DETECTOR_OPTIONAL_SCALARS = {"depthvar"}   # null = no intertidal prior
+DETECTOR_OPTIONAL_SCALARS = {"depthvar", "method"}   # null = no intertidal prior; method selects the detector
 # Sections of the detector config this process owns rather than the user.
 DETECTOR_OWNED = {"data", "output", "offset"}
 
@@ -202,6 +202,10 @@ def validate_detector(cfg: dict, path: Path) -> None:
     for key in DETECTOR_SCALARS:
         if key not in det:
             raise ValueError(f"{path}: detector.{key} is required")
+
+    method = det.get("method", "mixture")
+    if method not in ("mixture", "tukey"):
+        raise ValueError(f"{path}: detector.method must be 'mixture' or 'tukey', got {method!r}")
 
 
 def validate_filter(cfg: dict, path: Path) -> None:
@@ -304,8 +308,9 @@ def detector_cfg(cfg: dict, sid: str) -> dict:
     det = cfg["detector"]
     dcfg = copy.deepcopy(sod.DEFAULTS)
 
-    for section in ("reference", "covariate", "clear", "qc", "mixture", "solver"):
+    for section in ("reference", "covariate", "clear", "qc", "mixture", "solver", "tukey"):
         dcfg[section].update(det.get(section, {}))
+    dcfg["method"] = det.get("method", "mixture")
 
     dcfg["data"].update(
         cube=cfg["data"]["cube"], var=s["sst"], validvar=s["valid"], cloudvar=s["cloud"],

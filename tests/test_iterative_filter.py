@@ -20,6 +20,7 @@ if str(SRC) not in sys.path:
 
 import iterative_filter as F        # noqa: E402  (first: it bridges seasonal_smoothing)
 import edineof as E                 # noqa: E402
+import simple_outlier_detection as sod  # noqa: E402
 
 H = W = 24
 T = 60
@@ -36,6 +37,27 @@ def config(**loop) -> dict:
             "clear": {"sd": 0.75, "sd_floor": 0.71},
             "qc": {"enabled": True, "prior_cloud": 0.9, "nodata_prior": None},
             "mixture": {"prior_cloud": 0.1, "min_dev_cold": 0.0, "min_dev_hot": 0.0},
+        },
+        "sensors": {"eco": {"sst": "eco_sst", "valid": "eco_valid", "cloud": "eco_cloud",
+                            "hour": "eco_hour", "min_pixels": 64}},
+        "composite": {"hold": ["eco"]},
+        "dineof": {"matrix": {"min_date_obs": 10, "coarsen": 1},
+                   "em": {"tol": 1e-4, "max_iter": 200}},
+        "loop": {"strategy": "fixed", "k": 2, "t_c": 2.0, "max_iter": 6, "tol": 1e-3,
+                 "final_cv": False, **{"baseline_source": "all", **loop}},
+    }
+    return F.build_config(user, resolve=False)
+
+
+def config_tukey(**loop) -> dict:
+    """Same synthetic config as `config`, but with the Tukey detector selected."""
+    user = {
+        "detector": {
+            "ref_var": "modis_sst_aqua", "depthvar": "depth_cudem", "tidal_depth_m": 3.0,
+            "method": "tukey",
+            "tukey": {"k_low": 3.0, "k_high": 3.0, "min_pixels": 64},
+            "clear": {"sd": 0.75, "sd_floor": 0.71},
+            "qc": {"enabled": True, "prior_cloud": 0.9, "nodata_prior": None},
         },
         "sensors": {"eco": {"sst": "eco_sst", "valid": "eco_valid", "cloud": "eco_cloud",
                             "hour": "eco_hour", "min_pixels": 64}},
@@ -155,6 +177,70 @@ def test_clean_field_flags_nothing():
     assert (out["table"]["verdict"] == "KEPT").all()
 
 
+# --------------------------------------------------------------------------- tukey detector
+
+def test_tukey_recovers_cold_patches():
+    """The Tukey detector finds and removes the coherent -4 K patches; the loop converges."""
+    cfg = config_tukey()
+    inp, patch = make_inputs(cfg, patches=True)
+    assert patch.any()
+    out = F.run_loop(inp, cfg)
+
+    obs = observed_mask(inp)
+    keep = out["keep"]["eco"]
+    recall = float((~keep[patch]).mean())
+    assert recall > 0.9, f"only {recall:.1%} of patch pixels removed"
+    assert out["converged"], out["history"]
+    assert float(out["history"]["flip_frac_eco"].iloc[-1]) < 1e-3
+
+
+def test_tukey_clean_field_flags_nothing():
+    """No contamination: the Tukey fences leave almost everything, and the table keeps every scene."""
+    cfg = config_tukey()
+    inp, _ = make_inputs(cfg, patches=False)
+    out = F.run_loop(inp, cfg)
+    obs = observed_mask(inp)
+    removed = float((obs & ~out["keep"]["eco"]).sum() / obs.sum())
+    assert removed < 0.02, f"{removed:.2%} of a clean field flagged"
+    assert (out["table"]["verdict"] == "KEPT").all()
+
+
+def test_classify_tukey_flags_only_the_tails():
+    """A cold patch and a warm spike on noise are flagged; the clear noise is not."""
+    rng = np.random.default_rng(0)
+    land = np.ones((H, W), bool)
+    covariate = np.full((H, W), MEAN, dtype="float64")
+    y = covariate + rng.normal(scale=0.2, size=(H, W))
+    cold = np.zeros((H, W), bool); cold[2:9, 2:9] = True     # a 7x7 cold patch
+    warm = np.zeros((H, W), bool); warm[15, 15] = True        # a lone warm spike
+    y[cold] -= 5.0
+    y[warm] += 5.0
+    zeros = np.zeros((H, W), bool)
+    cfg = {"tukey": {"k_low": 3.0, "k_high": 3.0, "min_pixels": 64}}
+    res = sod.classify_tukey(y, land, zeros, covariate, zeros, zeros, zeros, cfg)
+
+    flagged = res["p_valid"] < 0.5
+    assert flagged[cold].all(), "cold patch not fully flagged"
+    assert flagged[warm].all(), "warm spike not flagged"
+    assert not flagged[~(cold | warm)].any(), "clear noise wrongly flagged"
+    assert set(np.unique(res["p_valid"])) <= {0.0, 1.0}, "p_valid is not a hard mask"
+    assert res["cloud_frac"] > 0 and res["warm_frac"] > 0
+
+
+def test_classify_tukey_below_min_pixels_keeps_everything():
+    """A scene with fewer observed water pixels than min_pixels keeps all of them."""
+    land = np.ones((H, W), bool)
+    covariate = np.full((H, W), MEAN, dtype="float64")
+    y = np.full((H, W), np.nan)
+    obs = (slice(0, 4), slice(0, 4))                          # 16 observed pixels < min_pixels
+    y[obs] = MEAN + np.array([0, 0, 0, 10.0] * 4).reshape(4, 4)   # includes an obvious outlier
+    zeros = np.zeros((H, W), bool)
+    cfg = {"tukey": {"k_low": 3.0, "k_high": 3.0, "min_pixels": 64}}
+    res = sod.classify_tukey(y, land, zeros, covariate, zeros, zeros, zeros, cfg)
+    observed = land & np.isfinite(y)
+    assert (res["p_valid"][observed] == 1.0).all(), "a sub-min_pixels scene flagged a pixel"
+
+
 def test_wrong_flags_are_restored():
     """Flags are not cumulative: an over-aggressive starting mask comes back."""
     cfg = config()
@@ -253,6 +339,23 @@ def test_unknown_keys_rejected():
                 "dineof": {"matrix": {"bogus": 1}}}
     with pytest.raises(ValueError, match="dineof.matrix.bogus"):
         F.build_config(cfg_user, resolve=False)
+
+
+def test_tukey_config_validated():
+    """detector.method/tukey are accepted; a bad method or unknown tukey key is rejected."""
+    # Accepted
+    cfg = config_tukey()
+    assert cfg["detector"]["method"] == "tukey"
+    assert F.detector_config(cfg, "eco")["method"] == "tukey"
+    # Bad method
+    bad = {**_min_user(), "detector": {**_min_user()["detector"], "method": "nope"}}
+    with pytest.raises(ValueError, match="detector.method"):
+        F.build_config(bad, resolve=False)
+    # Unknown tukey key
+    bad2 = {**_min_user(), "detector": {**_min_user()["detector"],
+                                        "method": "tukey", "tukey": {"bogus": 1}}}
+    with pytest.raises(ValueError, match="detector.tukey.bogus"):
+        F.build_config(bad2, resolve=False)
 
 
 def test_kappa():

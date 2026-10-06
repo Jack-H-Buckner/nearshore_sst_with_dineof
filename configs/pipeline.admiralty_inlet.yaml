@@ -82,47 +82,55 @@ detector:
   ref_var: modis_sst_aqua
   depthvar: depth_cudem
   tidal_depth_m: 3.0
-  reference:
-    window_days: 4
-    qc_var: null
-    qc_max: 1
-    quantile: 0.5
-    min_obs: 1
-    min_cover: 0.05
-  covariate:
-    init_prior: 285.0
-    init_range_px: 200.0
-    init_marg_sd: 0.05
-    init_obs_error: 0.5
-    alpha: 2
-  clear:
-    sd: 0.75
-    sd_floor: 0.71
-  qc:
-    enabled: true
-    prior_cloud: 0.9
-    nodata_prior: null          # per-sensor; overridden from sensors.<id>.qc_nodata_prior
-  mixture:
-    lambda_cloud: 4.0
-    # 0.0 is the unary the MODIS-baseline filter was built with (the term did not exist yet),
-    # so --compare measures the baseline and nothing else. Raise to match
-    # simple_outlier_detection.yaml (0.75 / 2.0) once the MODIS filter is rebuilt with it.
-    min_dev_cold: 0.0
-    prior_cloud: 0.1
-    lambda_hot: 6.5
-    min_dev_hot: 0.0
-    prior_hot: 0.005
-    p_h_tidal: 0.5
-    beta_cloud: 1.75
-    n_sweeps_cloud: 20
-    beta_hot: 0.125
-    n_sweeps_hot: 10
-    estep_damp: 0.5
-    p_floor: 0.01
-  solver:
-    tol: 1.0e-2
-    pcg_max_iter: 25
-    precondition: true
+  # Which detector classifies each scene against the DINEOF baseline:
+  #   mixture (default) -- two-sided cold/warm mixture with a mean-field Ising prior (below).
+  #   tukey             -- per-scene Tukey IQR fence on the residual; simpler, no spatial prior.
+  # method: tukey
+  tukey:
+    k_low: 1.5       # lower fence = Q1 - k_low * IQR
+    k_high: 1.5      # upper fence = Q3 + k_high * IQR
+    min_pixels: 64   # scenes with fewer observed water pixels keep everything
+  # reference:
+  #   window_days: 4
+  #   qc_var: null
+  #   qc_max: 1
+  #   quantile: 0.5
+  #   min_obs: 1
+  #   min_cover: 0.05
+  # covariate:
+  #   init_prior: 285.0
+  #   init_range_px: 200.0
+  #   init_marg_sd: 0.05
+  #   init_obs_error: 0.5
+  #   alpha: 2
+  # clear:
+  #   sd: 0.75
+  #   sd_floor: 0.71
+  # qc:
+  #   enabled: true
+  #   prior_cloud: 0.9
+  #   nodata_prior: null          # per-sensor; overridden from sensors.<id>.qc_nodata_prior
+  # mixture:
+  #   lambda_cloud: 4.0
+  #   # 0.0 is the unary the MODIS-baseline filter was built with (the term did not exist yet),
+  #   # so --compare measures the baseline and nothing else. Raise to match
+  #   # simple_outlier_detection.yaml (0.75 / 2.0) once the MODIS filter is rebuilt with it.
+  #   min_dev_cold: 0.0
+  #   prior_cloud: 0.1
+  #   lambda_hot: 6.5
+  #   min_dev_hot: 0.0
+  #   prior_hot: 0.005
+  #   p_h_tidal: 0.5
+  #   beta_cloud: 1.75
+  #   n_sweeps_cloud: 20
+  #   beta_hot: 0.125
+  #   n_sweeps_hot: 10
+  #   estep_damp: 0.5
+  #   p_floor: 0.01
+  # solver:
+  #   tol: 1.0e-2
+  #   pcg_max_iter: 25
+  #   precondition: true
 
 # ------------------------------------------------------------------ sensors
 # Ids must match the composite member ids: `<id>_offset` is read from the composite cube and

@@ -827,8 +827,10 @@ def classify_all(inp: Inputs, base: np.ndarray, cfg: dict, fig_scenes=()) -> dic
         for j in inp.scenes[sid]:
             y = r[j].astype("float64")
             flagged, gap, nodata = inp.qc[sid][j]
-            res = sod.classify(y, inp.water, inp.tidal, base[j].astype("float64"),
-                               flagged, gap, nodata, dcfg)
+            classify = (sod.classify_tukey if dcfg.get("method", "mixture") == "tukey"
+                        else sod.classify)
+            res = classify(y, inp.water, inp.tidal, base[j].astype("float64"),
+                           flagged, gap, nodata, dcfg)
             ok, reason = bc.scene_verdict({"center": res["center"]}, vcfg)
             px = (res["p_valid"] >= p_min) & inp.water & np.isfinite(y)
             if f["require_qc"]:

@@ -28,6 +28,14 @@ detector:
   ref_var: modis_sst_aqua
   depthvar: depth_cudem
   tidal_depth_m: 3.0
+  # Which detector classifies each scene against the DINEOF baseline:
+  #   mixture (default) -- two-sided cold/warm mixture with a mean-field Ising prior (below).
+  #   tukey             -- per-scene Tukey IQR fence on the residual; simpler, no spatial prior.
+  # method: tukey
+  # tukey:
+  #   k_low: 3.0       # lower fence = Q1 - k_low * IQR
+  #   k_high: 3.0      # upper fence = Q3 + k_high * IQR
+  #   min_pixels: 64   # scenes with fewer observed water pixels keep everything
   reference:
     window_days: 4
     qc_var: null

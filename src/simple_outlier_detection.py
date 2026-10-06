@@ -62,6 +62,9 @@ DEFAULT_CONFIG = ROOT / "configs" / "simple_outlier_detection.yaml"
 # ==================================================================== config
 
 DEFAULTS = {
+    # Which detector to run: the two-sided mixture + Ising prior (`mixture`, the default), or the
+    # simpler per-scene Tukey IQR-fence rule on the residual (`tukey`). See `classify_tukey`.
+    "method": "mixture",
     "data": {
         "cube": "data/datacube/admiralty_inlet.zarr",
         "var": "lst_sst",
@@ -125,6 +128,16 @@ DEFAULTS = {
         "tol": 1e-2,
         "pcg_max_iter": 25,
         "precondition": True,
+    },
+    "tukey": {
+        # Fences on the per-scene residual distribution: lo = Q1 - k_low * IQR, hi = Q3 + k_high
+        # * IQR. Classic Tukey uses 1.5 (outlier) / 3.0 (far out); 3.0 is the default here so the
+        # filter removes the clearly-cloudy tail without nibbling the clear-sky spread.
+        "k_low": 3.0,
+        "k_high": 3.0,
+        # Scenes with fewer observed water pixels than this keep everything -- the quartiles of a
+        # handful of pixels are too noisy to fence on. The whole-scene offset gate still applies.
+        "min_pixels": 64,
     },
 }
 
@@ -254,6 +267,52 @@ def classify(y, land, tidal, covariate, flagged, gap, nodata, cfg):
     return dict(residual=residual, p_valid=p_valid, q_cloud=q, q_hot=q_hot,
                 center=center, sd=sd,
                 cloud_frac=float(q[obs].mean()), warm_frac=float(q_hot[obs].mean()))
+
+
+def classify_tukey(y, land, tidal, covariate, flagged, gap, nodata, cfg):
+    """Per-scene Tukey IQR fence on the residual (y - covariate - center). A hard keep mask.
+
+    The simpler alternative to `classify`: no mixture, no Ising prior, no EM. The DINEOF low-rank
+    field is still the central tendency; a pixel is flagged iff its residual falls outside the
+    scene's Tukey fences [Q1 - k_low*IQR, Q3 + k_high*IQR]. Returns the SAME dict shape as
+    `classify` so it drops into the loop, figures and scene table unchanged. `tidal` is accepted
+    for signature parity with `classify` but unused.
+    """
+    tk = cfg["tukey"]
+    obs = land & np.isfinite(y)
+    if not obs.any():
+        raise ValueError("no observed water pixels")
+
+    # Same shorth centre as the mixture path, so `center` keeps its "sensor offset" meaning and
+    # bc.scene_verdict's offset gate fires identically (a near-total-cloud scene still pulls the
+    # centre cold and gets dropped).
+    r0 = (np.asarray(y, float) - np.asarray(covariate, float))[obs]
+    center, sd_est = robust_centre_scale(r0)
+    residual = y - covariate - center
+
+    cold = np.zeros(land.shape, bool)
+    warm = np.zeros(land.shape, bool)
+    iqr = 0.0
+    if int(obs.sum()) >= int(tk["min_pixels"]):
+        q1, q3 = np.nanpercentile(residual[obs], [25.0, 75.0])
+        iqr = float(q3 - q1)
+        lo = q1 - float(tk["k_low"]) * iqr
+        hi = q3 + float(tk["k_high"]) * iqr
+        with np.errstate(invalid="ignore"):
+            cold = obs & (residual < lo)
+            warm = obs & (residual > hi)
+
+    q_cloud = cold.astype("float64")
+    q_hot = warm.astype("float64")
+    # Hard keep mask: 1.0 inside the fences, 0.0 outside. Drops straight into the loop's
+    # `p_valid >= p_valid_min` cut (p_valid_min default 0.5).
+    p_valid = np.where(obs & ~cold & ~warm, 1.0, 0.0)
+    # Robust sigma from the IQR, for the scene table only (IQR = 1.349 sigma for a Gaussian).
+    sd = iqr / 1.349 if iqr > 0 else float(sd_est)
+
+    return dict(residual=residual, p_valid=p_valid, q_cloud=q_cloud, q_hot=q_hot,
+                center=center, sd=sd,
+                cloud_frac=float(q_cloud[obs].mean()), warm_frac=float(q_hot[obs].mean()))
 
 
 def flag_offset(center, cfg):
