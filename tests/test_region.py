@@ -261,14 +261,18 @@ def test_stage4_insitu_eval(plain, tmp_path):
                               "sources": ["observed", "point_fill", "day_fill"], "n_harmonics": 0,
                               "share": [], "bias_form": "constant", "bias_n_harmonics": 2,
                               "selection": "aic", "min_gain": 0.0}}
-    S4.run(rc, figures=False)
-    d = R.stage_dirs(rc)["pointfilter"] / "reports"
+    S4.run(rc, figures=True)
+    base = R.stage_dirs(rc)["pointfilter"]
+    d = base / "reports"
     assert (d / "insitu_eval_bias.json").exists()
     met = pd.read_csv(d / "insitu_eval_metrics.csv")
     allrow = met[met["site"] == "all"].iloc[0]
     assert np.isfinite(allrow["rmse_before"]) and np.isfinite(allrow["rmse_after"])
     loso = pd.read_csv(d / "insitu_eval_loso.csv")
     assert set(loso["left_out"].astype(str)) == {"S1", "S2"}
+    for f in ("insitu_eval_offset.png", "insitu_eval_loso.png", "insitu_eval_mse_by_site.png",
+              "insitu_eval_scatter.png", "insitu_eval_residuals.png"):
+        assert (base / "figures" / f).exists(), f
 
 
 # --------------------------------------------------------------------------- CLI

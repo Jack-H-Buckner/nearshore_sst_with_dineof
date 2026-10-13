@@ -72,7 +72,8 @@ nearshore-sst all      --config configs/region.admiralty_inlet.yaml
 | `nearshore-sst offsets -c CONFIG` | Stage 1 |
 | `nearshore-sst dineof -c CONFIG` | Stage 2 (needs stage 1) |
 | `nearshore-sst validate -c CONFIG` | Stage 3 (needs stage 2) |
-| `nearshore-sst all -c CONFIG` | Stages 1–3 in order |
+| `nearshore-sst pointfilter -c CONFIG` | Stage 4: point-level state-space smoothing, in-situ fusion / bias, and LOSO diagnostics (needs stage 2; configured by `point_filter:`) |
+| `nearshore-sst all -c CONFIG` | Stages 1–3 in order (plus stage 4 when `point_filter` is configured) |
 | `nearshore-sst status -c CONFIG` | What each stage has produced: offsets chosen, selected DINEOF settings, CV holdout error, MSE against in situ |
 | `nearshore-sst figures -c CONFIG` | Re-draws stage 2's figures from its cube without re-running it |
 | `nearshore-sst fetch-insitu --cube CUBE --start D --end D --out FILE.nc` | Downloads IOOS in-situ temperature for the cube's footprint (`--dry-run` lists the stations) |
@@ -464,6 +465,95 @@ nearshore-sst fetch-insitu --cube data/unfiltered/<aoi>.zarr \
 | `mse_by_site.png` | MSE per site and for all sites, per product, labelled with n |
 | `residuals.png` | Residual (product − in situ) against time for each site, residual distributions, residual against in-situ temperature, and residual by gap category |
 | `stations_map.png`, `timeseries_<site>.png`, `scatter.png`, `error_by_category.png` | Station positions and matched pixels; per-site series; scatter per product; RMSE by gap category |
+
+## Stage 4: point-level state-space smoothing
+
+```
+nearshore-sst pointfilter --config configs/region.<aoi>.yaml [--tag T]
+```
+
+Optional. Smooths the daily series at a handful of named locations with a linear-Gaussian
+state-space model (Kalman filter + RTS smoother) fit by maximum likelihood (statsmodels), fusing
+the cube's estimate types — a direct observation, a point- or day-filled DINEOF value, the smooth
+field — each with its own, MLE-estimated observation-error variance. It reads the stage-2 cube and
+writes to `stage4_pointfilter/`. Runs on its own; also joins `nearshore-sst all` when a group with
+`point_filter.points` (or `insitu_eval`) is configured. The stage is driven entirely by the
+`point_filter:` section of the region config (see `configs/region.template.yaml`); it is disabled
+when that section is empty.
+
+The stage offers three modes, which can be combined:
+
+### 1. Smooth named sites (points CSV)
+
+Give a CSV of sites (`site_id, lat, lon, group`) and, per `group`, a model and which observation
+types feed the filter. Four models — `random_walk`, `ar1`, `ar1_harmonic`, `harmonic_trend`.
+`mode: hierarchy` uses one observation per day by precedence; `mode: multiple` fuses several that
+day. Parameters (process variance, AR coefficient, harmonic/trend coefficients, per-type
+observation variances) are estimated by MLE and can be `share`d across a group's sites.
+
+```yaml
+point_filter:
+  points: configs/points.<aoi>.csv        # columns: site_id, lat, lon, group
+  groups:
+    moorings:
+      model: ar1_harmonic
+      n_harmonics: 2
+      mode: hierarchy
+      sources: [observed, point_fill, day_fill]
+      share: [process_var, phi, obs_var.observed, obs_var.point_fill, obs_var.day_fill]
+```
+
+### 2. Fuse in-situ and estimate a DINEOF bias (joint)
+
+Add `insitu` to a group's `sources` to feed independent in-situ measurements (from
+`validation.insitu`, matched to each site by the nearest station within `max_snap_m`) as a second,
+unbiased observation. Set `dineof_bias: constant|seasonal` to estimate a DINEOF measurement bias
+`SST_dineof = SST + c0 + seasonal(DOY)` jointly with the smoother; in-situ anchors the latent SST
+so the bias is identifiable and the smoothed series is bias-corrected to in-situ scale. Requires
+`mode: multiple`.
+
+```yaml
+    calibrated:
+      model: random_walk
+      mode: multiple
+      sources: [insitu, observed, point_fill, day_fill]
+      dineof_bias: seasonal
+      bias_n_harmonics: 1
+      share: [process_var, obs_var.insitu, obs_var.observed, bias_const, bias_seasonal]
+```
+
+### 3. Post-hoc bias + LOSO diagnostics at the in-situ sites (no CSV)
+
+`insitu_eval` evaluates the filter's accuracy against in-situ with a **post-hoc** (two-step) bias
+correction: (1) fit the smoother once on DINEOF sources only at each in-situ site, (2) fit a bias
+(`insitu − smoothed`, constant or seasonal) afterward, and score it **out-of-sample by
+leave-one-site-out (LOSO)** — refit the bias on the other sites and evaluate at the held-out site.
+Sites come from `validation.insitu`; no points CSV is needed (LOSO needs ≥ 2 in-situ sites).
+
+```yaml
+point_filter:
+  insitu_eval:
+    enabled: true
+    model: random_walk
+    sources: [observed, point_fill, day_fill]   # DINEOF-only (no `insitu`)
+    bias_form: auto           # constant | seasonal | auto (chosen by `selection`)
+    bias_n_harmonics: 2
+    selection: aic            # aic | loso_cv
+```
+
+### Outputs: `stage4_pointfilter/`
+
+| File | Contents |
+|---|---|
+| `reports/point_series.csv` | Modes 1–2: per site × day — the fed observation and its type, smoothed mean and SD, 95% band, in-situ value and the estimated DINEOF bias |
+| `reports/point_params.csv` | Modes 1–2: fitted parameters per group (process/obs variances, AR, harmonics, bias), with log-likelihood and AIC |
+| `<aoi>_points.zarr` | Modes 1–2: `(time, site)` cube of `smoothed_mean`, `smoothed_sd`, `y_obs`, `insitu_obs`, `dineof_bias` |
+| `reports/insitu_eval_bias.json` | Mode 3: chosen bias form, coefficients, per-form AIC / LOSO-CV |
+| `reports/insitu_eval_metrics.csv` | Mode 3: bias / RMSE vs in-situ before and after the post-hoc bias, overall and per site |
+| `reports/insitu_eval_loso.csv` | Mode 3: per held-out site — refit coefficients and the corrected residual at the site the bias never saw |
+| `figures/<site>.png` | Modes 1–2: per-site smoothed series (observations by type, mean + 95% band, in-situ, bias curve) |
+| `figures/insitu_eval_offset.png`, `insitu_eval_loso.png` | Mode 3: the fitted bias curve over the matchup residuals; the offset's sensitivity across LOSO refits |
+| `figures/insitu_eval_mse_by_site.png`, `insitu_eval_scatter.png`, `insitu_eval_residuals.png` | Mode 3: validation-style plots of the smoothed point estimate, **before vs after** the post-hoc bias — RMSE per site, estimate-vs-in-situ scatter, and residuals over time / vs in-situ temperature |
 
 ## Configuration reference
 

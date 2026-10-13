@@ -34,6 +34,7 @@ import plotting
 import region as R
 import state_space as SS
 import validate_insitu as V
+from cube_figures import GRID, INK, INK_MUTED, INK_SECONDARY, SURFACE
 from nearshore_sst import datacube, provenance, store
 from nearshore_sst.datacube import CompressionSpec
 
@@ -317,12 +318,20 @@ def _run_insitu_eval(ds, rc: dict, pf: dict, ev: dict, out: Path, times, figures
     if figures:
         try:
             dpi = int(pf["dpi"])
+            # The bias-corrected estimate and residuals before/after, for the validation plots.
+            mu = mu.assign(corrected=mu["smoothed"] + C5._predict(coef, mu["date"], form, H, P))
+            mu = mu.assign(resid_before=mu["smoothed"] - mu["insitu"],
+                           resid_after=mu["corrected"] - mu["insitu"])
             curve = C5._predict(coef, times, form, H, P)
             C5._offset_figure(mu, "smoothed", bias_info, curve, times, H, P,
                               out / "figures" / "insitu_eval_offset.png", dpi)
             if not loso.empty:
                 C5._loso_figure(loso, bias_info, "smoothed",
                                 out / "figures" / "insitu_eval_loso.png", dpi)
+            # Validation-style plots of the smoothed point estimate, before vs after the bias.
+            _eval_mse_by_site(met, out / "figures" / "insitu_eval_mse_by_site.png", dpi)
+            _eval_scatter(mu, out / "figures" / "insitu_eval_scatter.png", dpi)
+            _eval_residuals(mu, out / "figures" / "insitu_eval_residuals.png", dpi)
         except Exception as e:                        # a plotting bug must not lose the diagnostics
             log.warning("insitu_eval figures failed: %s", e)
 
@@ -395,4 +404,88 @@ def _site_figure(site: str, series_df: pd.DataFrame, path: Path, dpi: int) -> No
     ax.set_title(f"{site}: state-space smoothed SST", fontsize=10)
     ax.set_ylabel("SST [degC]", fontsize=8)
     ax.legend(fontsize=6, ncol=5, loc="upper right")
+    plotting.save(fig, path, dpi=dpi)
+
+
+# --------------------------------------------------------------------------- insitu_eval figures
+
+_BEFORE, _AFTER = "#adb5bd", "#1864ab"      # before / after the post-hoc bias
+
+
+def _style(ax) -> None:
+    ax.set_facecolor(SURFACE)
+    ax.grid(color=GRID, linewidth=0.6)
+    ax.set_axisbelow(True)
+    for s in ax.spines.values():
+        s.set_color(GRID)
+    ax.tick_params(colors=INK_SECONDARY, labelsize=7)
+
+
+def _eval_mse_by_site(met: pd.DataFrame, path: Path, dpi: int) -> None:
+    """RMSE of the smoothed estimate vs in-situ, per site and for all sites, before vs after the
+    post-hoc bias (mirrors stage 3's mse_by_site)."""
+    sites = [s for s in met["site"] if s != "all"]
+    order = (["all"] + sorted(sites)) if (met["site"] == "all").any() else sorted(sites)
+    m = met.set_index("site").reindex(order)
+    x = np.arange(len(order))
+    fig, ax = plt.subplots(figsize=(max(6, 1.3 * len(order) + 2), 4.0), dpi=dpi,
+                           layout="constrained")
+    ax.bar(x - 0.2, m["rmse_before"].to_numpy(float), 0.4, color=_BEFORE, label="before bias")
+    ax.bar(x + 0.2, m["rmse_after"].to_numpy(float), 0.4, color=_AFTER, label="after bias")
+    for xi, n in zip(x, m["n"].to_numpy()):
+        ax.annotate(f"n={int(n)}", (xi, 0), xytext=(0, 2), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=6.5, color=INK_SECONDARY)
+    ax.set_xticks(x, order, fontsize=8, rotation=0)
+    _style(ax)
+    ax.set_ylabel("RMSE vs in situ [K]", fontsize=8)
+    ax.set_title("smoothed point estimate: RMSE before vs after the post-hoc bias", fontsize=10,
+                 color=INK, loc="left")
+    ax.legend(fontsize=7, frameon=False)
+    plotting.save(fig, path, dpi=dpi)
+
+
+def _eval_scatter(mu: pd.DataFrame, path: Path, dpi: int) -> None:
+    """Smoothed (before) and bias-corrected (after) estimate vs in-situ, 1:1 line."""
+    fig, axes = plt.subplots(1, 2, figsize=(8.4, 4.2), dpi=dpi, layout="constrained", sharex=True,
+                             sharey=True)
+    lo = float(np.nanmin([mu["insitu"].min(), mu["smoothed"].min(), mu["corrected"].min()]))
+    hi = float(np.nanmax([mu["insitu"].max(), mu["smoothed"].max(), mu["corrected"].max()]))
+    for ax, col, title, resid in ((axes[0], "smoothed", "before bias", "resid_before"),
+                                  (axes[1], "corrected", "after bias", "resid_after")):
+        for s, g in mu.groupby("station_id"):
+            ax.scatter(g["insitu"], g[col], s=12, alpha=0.6, edgecolor="none", label=str(s))
+        ax.plot([lo, hi], [lo, hi], color=INK_MUTED, lw=1)
+        r = mu[resid].to_numpy(float)
+        _style(ax)
+        ax.set_xlabel("in situ [degC]", fontsize=8)
+        ax.set_title(f"{title}: bias {np.mean(r):+.2f}, RMSE {np.sqrt(np.mean(r**2)):.2f} K",
+                     fontsize=9, color=INK, loc="left")
+    axes[0].set_ylabel("smoothed estimate [degC]", fontsize=8)
+    axes[1].legend(fontsize=6.5, frameon=False, ncol=2)
+    plotting.save(fig, path, dpi=dpi)
+
+
+def _eval_residuals(mu: pd.DataFrame, path: Path, dpi: int) -> None:
+    """Residual (estimate - in situ) against time per site, and against in-situ temperature,
+    before vs after the bias (mirrors stage 3's residuals)."""
+    t = pd.to_datetime(mu["date"])
+    fig, (a0, a1) = plt.subplots(1, 2, figsize=(10.5, 3.8), dpi=dpi, layout="constrained")
+    for s, g in mu.groupby("station_id"):
+        gi = mu.index.get_indexer(g.index)
+        a0.plot(t.iloc[gi], g["resid_after"], ".", ms=3.5, alpha=0.7, label=str(s))
+    a0.axhline(0, color=INK_MUTED, lw=1)
+    _style(a0)
+    a0.set_ylabel("corrected - in situ [K]", fontsize=8)
+    a0.set_title("residual over time (after bias)", fontsize=9, color=INK, loc="left")
+    a0.legend(fontsize=6.5, frameon=False, ncol=2)
+    a1.scatter(mu["insitu"], mu["resid_before"], s=12, alpha=0.5, edgecolor="none",
+               color=_BEFORE, label="before")
+    a1.scatter(mu["insitu"], mu["resid_after"], s=12, alpha=0.5, edgecolor="none",
+               color=_AFTER, label="after")
+    a1.axhline(0, color=INK_MUTED, lw=1)
+    _style(a1)
+    a1.set_xlabel("in situ [degC]", fontsize=8)
+    a1.set_ylabel("estimate - in situ [K]", fontsize=8)
+    a1.set_title("residual vs in-situ temperature", fontsize=9, color=INK, loc="left")
+    a1.legend(fontsize=7, frameon=False)
     plotting.save(fig, path, dpi=dpi)
