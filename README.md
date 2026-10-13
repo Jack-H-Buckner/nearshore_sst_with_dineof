@@ -560,6 +560,7 @@ point_filter:
 | `figures/<site>.png` | Modes 1–2: per-site smoothed series (observations by type, mean + 95% band, in-situ, bias curve) |
 | `figures/insitu_eval_offset.png`, `insitu_eval_loso.png` | Mode 3: the fitted bias curve over the matchup residuals; the offset's sensitivity across LOSO refits |
 | `figures/insitu_eval_mse_by_site.png`, `insitu_eval_scatter.png`, `insitu_eval_residuals.png` | Mode 3: validation-style plots of the smoothed point estimate, **before vs after** the post-hoc bias — RMSE per site, estimate-vs-in-situ scatter, and residuals over time / vs in-situ temperature |
+| `figures/timeseries_<site>.png` | Mode 3: per-site time series (stage-3 style) — the DINEOF products at the pixel, the smoothed estimate with its 95% band and its bias-corrected version, and the in-situ daily values |
 
 ## Configuration reference
 

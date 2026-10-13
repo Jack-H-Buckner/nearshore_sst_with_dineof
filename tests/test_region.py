@@ -271,7 +271,8 @@ def test_stage4_insitu_eval(plain, tmp_path):
     loso = pd.read_csv(d / "insitu_eval_loso.csv")
     assert set(loso["left_out"].astype(str)) == {"S1", "S2"}
     for f in ("insitu_eval_offset.png", "insitu_eval_loso.png", "insitu_eval_mse_by_site.png",
-              "insitu_eval_scatter.png", "insitu_eval_residuals.png"):
+              "insitu_eval_scatter.png", "insitu_eval_residuals.png",
+              "timeseries_S1.png", "timeseries_S2.png"):
         assert (base / "figures" / f).exists(), f
 
 

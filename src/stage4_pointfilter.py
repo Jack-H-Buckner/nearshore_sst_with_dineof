@@ -354,6 +354,7 @@ def _run_insitu_eval(ds, rc: dict, pf: dict, ev: dict, out: Path, times, figures
             _eval_mse_by_site(met, out / "figures" / "insitu_eval_mse_by_site.png", dpi)
             _eval_scatter(mu, out / "figures" / "insitu_eval_scatter.png", dpi)
             _eval_residuals(mu, out / "figures" / "insitu_eval_residuals.png", dpi)
+            _eval_timeseries(ds, ok, times, fit, daily, coef, form, H, P, out / "figures", dpi)
         except Exception as e:                        # a plotting bug must not lose the diagnostics
             log.warning("insitu_eval figures failed: %s", e)
 
@@ -511,3 +512,34 @@ def _eval_residuals(mu: pd.DataFrame, path: Path, dpi: int) -> None:
     a1.set_title("residual vs in-situ temperature", fontsize=9, color=INK, loc="left")
     a1.legend(fontsize=7, frameon=False)
     plotting.save(fig, path, dpi=dpi)
+
+
+def _eval_timeseries(ds, ok: pd.DataFrame, times, fit: dict, daily: dict, coef, form: str,
+                     H: int, P: float, out_dir: Path, dpi: int) -> None:
+    """Per-site time series (stage-3 style): the DINEOF products at the site pixel, the
+    state-space smoothed estimate (+ 95% band) and its bias-corrected version, and the in-situ
+    daily values — one `timeseries_<site>.png` per in-situ site."""
+    import stage5_calibrate as C5
+    bias_full = C5._predict(coef, times, form, H, P)                 # (T,) post-hoc bias curve
+    for k in range(len(ok)):
+        sid = ok.loc[k, "station_id"]
+        row, col = int(ok.loc[k, "row"]), int(ok.loc[k, "col"])
+        mean, sd = fit["smoothed"][k]
+        fig, ax = plt.subplots(figsize=(13, 4), dpi=dpi, layout="constrained")
+        ax.fill_between(times, mean - 1.96 * sd, mean + 1.96 * sd, color="#9ec5fe", alpha=0.4,
+                        lw=0, label="95% band")
+        for p, lbl in ((_FILLED, "sst_filled"), (_SMOOTH, "sst_smooth")):
+            if p in ds:
+                ax.plot(times, ds[p].values[:, row, col] - 273.15,
+                        color=V.PRODUCT_COLORS.get(lbl, "#2a78d6"), lw=1.0, alpha=0.75, label=lbl)
+        ax.plot(times, mean, color="#1864ab", lw=1.6, label="smoothed (DINEOF)")
+        ax.plot(times, mean + bias_full, color="#e8590c", lw=1.3, ls="--", label="bias-corrected")
+        ins = np.asarray(daily[sid], float)
+        fin = np.isfinite(ins)
+        if fin.any():
+            ax.plot(times[fin], ins[fin], "s", ms=3, mfc="none", color="#0b0b0b", label="in situ")
+        _style(ax)
+        ax.set_ylabel("temperature [degC]", fontsize=8)
+        ax.set_title(f"{sid}  (pixel row {row}, col {col})", fontsize=9, color=INK, loc="left")
+        ax.legend(fontsize=7, frameon=False, ncol=6, loc="upper left")
+        plotting.save(fig, out_dir / f"timeseries_{str(sid).replace('/', '_')}.png", dpi)
