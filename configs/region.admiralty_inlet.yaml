@@ -255,6 +255,16 @@ validation:
 #       bias_n_harmonics: 1          # required (>=1) for a seasonal bias
 #       share: [process_var, obs_var.insitu, obs_var.observed, obs_var.point_fill,
 #               obs_var.day_fill, bias_const, bias_seasonal]
+#   # Diagnostic (no points CSV needed): smooth each in-situ site on DINEOF sources only, then fit
+#   # a POST-HOC bias (insitu - smoothed) and evaluate it out-of-sample by leave-one-site-out.
+#   insitu_eval:
+#     enabled: true
+#     model: random_walk
+#     mode: hierarchy
+#     sources: [observed, point_fill, day_fill]   # DINEOF types only (no `insitu`)
+#     bias_form: auto              # constant | seasonal | auto (chosen by `selection`)
+#     bias_n_harmonics: 2
+#     selection: aic               # aic | loso_cv
 
 # ------------------------------------------------------------------ stage 5: calibration
 # Optional. Per-product additive offset (insitu - product) fit on the daily-mean matchups and

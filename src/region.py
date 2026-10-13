@@ -61,6 +61,21 @@ POINT_FILTER_DEFAULTS = {
     "max_snap_m": 300.0,            # a site on land snaps to the nearest water pixel within this
     "dpi": 130,
     "groups": {},                   # name -> {model, mode, sources, n_harmonics, share, ...}
+    # Optional diagnostic: smooth each in-situ site (from validation.insitu, no CSV) on DINEOF
+    # sources only, then fit a POST-HOC bias (insitu - smoothed) and evaluate it out-of-sample by
+    # leave-one-site-out. Enabled on its own; `points` may be null.
+    "insitu_eval": {
+        "enabled": False,
+        "model": "random_walk",     # smoother model (DINEOF-only)
+        "mode": "hierarchy",
+        "sources": ["observed", "point_fill", "day_fill"],   # DINEOF types only, no `insitu`
+        "n_harmonics": 0,           # smoother harmonics (for ar1_harmonic / harmonic_trend)
+        "share": [],
+        "bias_form": "auto",        # constant | seasonal | auto (auto -> chosen by `selection`)
+        "bias_n_harmonics": 2,      # harmonics of the post-hoc seasonal bias
+        "selection": "aic",         # when bias_form is auto: aic | loso_cv
+        "min_gain": 0.0,            # AIC units the seasonal form must beat the constant form by
+    },
 }
 
 # Stage 5 (optional): calibrate the DINEOF fields against in-situ. A per-product additive offset
@@ -165,9 +180,12 @@ def validate_point_filter(pf: dict, path: Path | str) -> None:
     groups = pf["groups"] or {}
     if not isinstance(groups, dict):
         raise ValueError(f"{path}: point_filter.groups must be a mapping of name -> block")
-    if not groups:
+    ev = pf.get("insitu_eval") or {}
+    if not groups and not ev.get("enabled"):
         return
     import state_space as SS                       # imported only when stage 4 is configured
+    if ev.get("enabled"):
+        _validate_insitu_eval(ev, "point_filter.insitu_eval", path, SS)
     gkeys = {"model", "n_harmonics", "mode", "sources", "share", "period_days", "fit",
              "dineof_bias", "bias_n_harmonics"}
     for name, g in groups.items():
@@ -224,6 +242,51 @@ def validate_point_filter(pf: dict, path: Path | str) -> None:
             if sh not in valid_share:
                 raise ValueError(f"{path}: {where}.share: {sh!r} is not a shareable parameter "
                                  f"for model {model!r}; allowed {sorted(valid_share)}")
+
+
+def _validate_insitu_eval(ev: dict, where: str, path: Path | str, SS) -> None:
+    """Check the point_filter.insitu_eval diagnostic block (smoother + post-hoc bias + LOSO)."""
+    allowed = {"enabled", "model", "mode", "sources", "n_harmonics", "share", "bias_form",
+               "bias_n_harmonics", "selection", "min_gain"}
+    for k in ev:
+        if k not in allowed:
+            raise ValueError(f"{path}: unknown key '{where}.{k}'")
+    model = ev.get("model")
+    if model not in SS.MODELS:
+        raise ValueError(f"{path}: {where}.model must be one of {SS.MODELS}, got {model!r}")
+    if ev.get("mode", "hierarchy") not in ("hierarchy", "multiple"):
+        raise ValueError(f"{path}: {where}.mode must be 'hierarchy' or 'multiple'")
+    sources = ev.get("sources")
+    if not sources or not isinstance(sources, list):
+        raise ValueError(f"{path}: {where}.sources must be a non-empty list of DINEOF types")
+    for s in sources:
+        if s not in SS.ALL_TYPES:
+            raise ValueError(f"{path}: {where}.sources: unknown type {s!r}; allowed {SS.ALL_TYPES}")
+        if SS.TYPE_CHANNEL[s] not in SS.DINEOF_CHANNELS:
+            raise ValueError(f"{path}: {where}.sources must be DINEOF-only (the smoother is fit "
+                             f"without in-situ); drop {s!r}")
+    H = int(ev.get("n_harmonics", 0))
+    if model in SS.HARMONIC_MODELS and H < 1:
+        raise ValueError(f"{path}: {where}.model {model!r} needs n_harmonics >= 1")
+    if model not in SS.HARMONIC_MODELS and H > 0:
+        raise ValueError(f"{path}: {where}.model {model!r} takes no harmonics; drop n_harmonics")
+    if ev.get("bias_form", "auto") not in ("constant", "seasonal", "auto"):
+        raise ValueError(f"{path}: {where}.bias_form must be constant | seasonal | auto")
+    if int(ev.get("bias_n_harmonics", 2)) < 1:
+        raise ValueError(f"{path}: {where}.bias_n_harmonics must be >= 1")
+    if ev.get("selection", "aic") not in CAL_SELECTIONS:
+        raise ValueError(f"{path}: {where}.selection must be one of {CAL_SELECTIONS}")
+    if float(ev.get("min_gain", 0.0)) < 0:
+        raise ValueError(f"{path}: {where}.min_gain must be >= 0")
+    valid_share = {"process_var"} | {f"obs_var.{t}" for t in sources}
+    if model in ("ar1", "ar1_harmonic"):
+        valid_share |= {"phi", "mu"}
+    if model in SS.HARMONIC_MODELS:
+        valid_share |= {"beta"}
+    for sh in (ev.get("share") or []):
+        if sh not in valid_share:
+            raise ValueError(f"{path}: {where}.share: {sh!r} is not a shareable smoother "
+                             f"parameter for model {model!r}; allowed {sorted(valid_share)}")
 
 
 def validate_calibration(cal: dict, path: Path | str) -> None:

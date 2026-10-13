@@ -234,6 +234,43 @@ def test_stage4_insitu_bias(plain, tmp_path):
         assert np.isfinite(ps["insitu_obs"].values).any()      # in-situ was matched and fed
 
 
+def _insitu_csv_multi(plain, path):
+    """Two in-situ stations at water pixels, 10-min sampling (passes daily-mean coverage)."""
+    truth = plain["truth"]
+    tr = Transformer.from_crs("EPSG:32610", "EPSG:4326", always_xy=True)
+    rows = []
+    for sid, (row, col) in [("S1", (20, 30)), ("S2", (22, 28))]:
+        x = SC.X0 + SC.DX * (col + 0.5); y = SC.Y0 - SC.DX * (row + 0.5)
+        lon, lat = tr.transform(x, y)
+        for j, t in enumerate(truth["times"][:120]):
+            for h in np.arange(0, 24, 1 / 6):
+                rows.append(dict(station_id=sid, time=t + pd.Timedelta(hours=h), latitude=lat,
+                                 longitude=lon, value=truth["truth"][j, row, col] - 273.15))
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+def test_stage4_insitu_eval(plain, tmp_path):
+    """Post-hoc bias + LOSO diagnostic at the in-situ sites (no points CSV)."""
+    csv = _insitu_csv_multi(plain, tmp_path / "insitu_multi.csv")
+    rc = dict(plain["rc"])
+    rc["validation"] = {**rc["validation"], "insitu": str(csv)}
+    rc["point_filter"] = {"points": None, "period_days": 365.25, "max_snap_m": 500.0, "dpi": 60,
+                          "groups": {}, "insitu_eval": {
+                              "enabled": True, "model": "random_walk", "mode": "hierarchy",
+                              "sources": ["observed", "point_fill", "day_fill"], "n_harmonics": 0,
+                              "share": [], "bias_form": "constant", "bias_n_harmonics": 2,
+                              "selection": "aic", "min_gain": 0.0}}
+    S4.run(rc, figures=False)
+    d = R.stage_dirs(rc)["pointfilter"] / "reports"
+    assert (d / "insitu_eval_bias.json").exists()
+    met = pd.read_csv(d / "insitu_eval_metrics.csv")
+    allrow = met[met["site"] == "all"].iloc[0]
+    assert np.isfinite(allrow["rmse_before"]) and np.isfinite(allrow["rmse_after"])
+    loso = pd.read_csv(d / "insitu_eval_loso.csv")
+    assert set(loso["left_out"].astype(str)) == {"S1", "S2"}
+
+
 # --------------------------------------------------------------------------- CLI
 
 def test_run_region_all(tmp_path, plain):

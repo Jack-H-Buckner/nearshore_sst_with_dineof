@@ -169,6 +169,13 @@ validation:
 #       dineof_bias: seasonal
 #       bias_n_harmonics: 1
 #       share: [process_var, obs_var.insitu, bias_const, bias_seasonal]
+#   insitu_eval:              # diagnostic: smoother at in-situ sites + post-hoc bias + LOSO
+#     enabled: true
+#     model: random_walk
+#     sources: [observed, point_fill, day_fill]   # DINEOF-only
+#     bias_form: auto
+#     bias_n_harmonics: 2
+#     selection: aic
 
 # ------------------------------------------------------------------ stage 5: calibration
 # Optional. Fit an additive offset (insitu - product) per DINEOF product and apply it to produce

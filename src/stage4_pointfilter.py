@@ -141,34 +141,49 @@ def run(rc: dict, *, tag: str | None = None, figures: bool = True) -> dict:
         raise SystemExit(f"no stage-2 cube at {cube}; run:\n  python src/run_region.py "
                          f"--config {rc['path']}{' --tag ' + tag if tag else ''} dineof")
     pf = rc["point_filter"]
-    if not pf.get("points"):
-        raise SystemExit("point_filter.points is null; set it to a CSV of site_id, lat, lon, group")
-    if not Path(pf["points"]).exists():
+    ev = pf.get("insitu_eval") or {}
+    do_points = bool(pf.get("points"))
+    do_eval = bool(ev.get("enabled"))
+    if not do_points and not do_eval:
+        raise SystemExit("point_filter: set `points` (a CSV of site_id, lat, lon, group) and/or "
+                         "insitu_eval.enabled: true")
+    if do_points and not Path(pf["points"]).exists():
         raise SystemExit(f"point_filter.points: no such file {pf['points']}")
 
     out = dirs["pointfilter"]
     (out / "reports").mkdir(parents=True, exist_ok=True)
-    points = _read_points(Path(pf["points"]))
-
+    result = {"dir": out}
     with xr.open_zarr(cube) as ds:
-        water = np.asarray(ds[rc["region"]["watervar"]].values > 0.5)
-        placed = V.place_stations(points, ds, water, float(pf["max_snap_m"]))
-        placed = placed.merge(points[["station_id", "group"]], on="station_id", how="left")
-        ok = placed[placed["row"] >= 0].reset_index(drop=True)
-        if ok.empty:
-            raise SystemExit("no sites placed on water; check lat/lon and point_filter.max_snap_m")
-        groups = list(ok["group"].unique())
-        for name in groups:
-            if name not in pf["groups"]:
-                raise SystemExit(f"points CSV has group {name!r} with no point_filter.groups entry")
         times = pd.to_datetime(ds["time"].values)
-        series = extract_series(ds, ok)
         crs = ds.attrs.get("crs")
-        # In-situ channel: only read when some group actually uses it.
-        if any("insitu" in _group_cfg(pf, g)["sources"] for g in groups):
-            I = insitu_series(ds, ok, rc, times.normalize())
-            for i in range(len(ok)):
-                series[i]["I"] = I[:, i]
+        if do_points:
+            result.update(_run_points(ds, rc, pf, out, times, crs, cube, figures))
+        if do_eval:
+            result["insitu_eval"] = _run_insitu_eval(ds, rc, pf, ev, out, times, figures)
+    log.info("stage 4 done in %.1f min -> %s", (time.time() - t0) / 60, out)
+    return result
+
+
+def _run_points(ds, rc: dict, pf: dict, out: Path, times, crs, cube: Path,
+                figures: bool) -> dict:
+    """The points-CSV workflow: smooth each site's series per group, write series/params/zarr."""
+    points = _read_points(Path(pf["points"]))
+    water = np.asarray(ds[rc["region"]["watervar"]].values > 0.5)
+    placed = V.place_stations(points, ds, water, float(pf["max_snap_m"]))
+    placed = placed.merge(points[["station_id", "group"]], on="station_id", how="left")
+    ok = placed[placed["row"] >= 0].reset_index(drop=True)
+    if ok.empty:
+        raise SystemExit("no sites placed on water; check lat/lon and point_filter.max_snap_m")
+    groups = list(ok["group"].unique())
+    for name in groups:
+        if name not in pf["groups"]:
+            raise SystemExit(f"points CSV has group {name!r} with no point_filter.groups entry")
+    series = extract_series(ds, ok)
+    # In-situ channel: only read when some group actually uses it.
+    if any("insitu" in _group_cfg(pf, g)["sources"] for g in groups):
+        I = insitu_series(ds, ok, rc, times.normalize())
+        for i in range(len(ok)):
+            series[i]["I"] = I[:, i]
 
     series_rows, param_rows, fitted = [], [], {}
     for name in groups:
@@ -211,9 +226,107 @@ def run(rc: dict, *, tag: str | None = None, figures: bool = True) -> dict:
         except Exception as e:                       # a plotting bug must not lose the outputs
             log.warning("stage 4 figures failed: %s", e)
 
-    log.info("stage 4 done in %.1f min -> %s (%d sites, %d groups)",
-             (time.time() - t0) / 60, out, len(ok), len(fitted))
-    return dict(dir=out, n_sites=len(ok), groups=list(fitted), series=series_df)
+    log.info("stage 4 points: %d sites, %d groups -> %s", len(ok), len(fitted), out)
+    return dict(n_sites=len(ok), groups=list(fitted), series=series_df)
+
+
+def _run_insitu_eval(ds, rc: dict, pf: dict, ev: dict, out: Path, times, figures: bool) -> dict:
+    """Diagnostic: smooth each in-situ site's DINEOF series (NO in-situ in the fit), fit a POST-HOC
+    bias on (insitu - smoothed), and evaluate it out-of-sample by leave-one-site-out (LOSO).
+
+    Two steps, deliberately post-hoc: (1) the state-space smoother runs on DINEOF sources only and
+    gives a point estimate at each in-situ pixel; (2) a bias (constant or seasonal day-of-year) is
+    fit by OLS on (insitu - smoothed) pooled across sites. LOSO refits the bias with each site left
+    out and scores the correction at that held-out site -- the filter's accuracy after a bias
+    adjustment that did not see the site. Reuses stage 5's offset / metric / LOSO helpers.
+    """
+    import stage5_calibrate as C5                   # OLS offset + metrics + LOSO on a matchup frame
+    insitu_path = rc["validation"]["insitu"]
+    if not insitu_path or not Path(insitu_path).exists():
+        raise SystemExit("point_filter.insitu_eval needs validation.insitu (a netCDF / CSV)")
+    vcfg = R.validate_vcfg(rc)
+    df = V.read_insitu(Path(insitu_path), vcfg)
+    water = np.asarray(ds[rc["region"]["watervar"]].values > 0.5)
+    stations = df.groupby("station_id", as_index=False).agg(
+        station_name=("station_name", "first"), lat=("lat", "median"), lon=("lon", "median"))
+    ok = V.place_stations(stations, ds, water, float(pf["max_snap_m"]))
+    ok = ok[ok["row"] >= 0].reset_index(drop=True)
+    if ok.empty:
+        raise SystemExit("insitu_eval: no in-situ stations placed on water")
+
+    # (1) smoother on DINEOF only -- one group, no in-situ channel.
+    series = extract_series(ds, ok)
+    gcfg = dict(model=ev["model"], mode=ev["mode"], sources=list(ev["sources"]),
+                n_harmonics=int(ev.get("n_harmonics", 0)), share=list(ev.get("share") or []),
+                period_days=float(pf["period_days"]))
+    log.info("insitu_eval: smoothing %d in-situ site(s), model %s, sources %s",
+             len(ok), gcfg["model"], gcfg["sources"])
+    fit = SS.fit_group(times, series, gcfg)
+
+    # matchup frame: the smoothed point estimate vs the in-situ daily mean, per site x day.
+    days = times.normalize()
+    min_cov = float(vcfg["match"]["min_coverage"])
+    rows, smoothed = [], {}
+    for k in range(len(ok)):
+        sm = fit["smoothed"][k][0]
+        smoothed[ok.loc[k, "station_id"]] = sm
+        dm, _ = V.match_daily_mean(df[df["station_id"] == ok.loc[k, "station_id"]], days, min_cov)
+        for t in np.flatnonzero(np.isfinite(dm)):
+            rows.append(dict(station_id=ok.loc[k, "station_id"], date=days[t].strftime("%Y-%m-%d"),
+                             t=int(t), insitu=float(dm[t]), smoothed=float(sm[t])))
+    mu = pd.DataFrame(rows)
+    if mu.empty:
+        raise SystemExit("insitu_eval: no in-situ matchups against the smoothed estimate")
+    n_sites = int(mu["station_id"].nunique())
+
+    # (2) post-hoc bias on (insitu - smoothed); form chosen by stage 5's selection.
+    H, P = int(ev["bias_n_harmonics"]), float(pf["period_days"])
+    cal = dict(n_harmonics=H, period_days=P, min_gain=float(ev.get("min_gain", 0.0)),
+               selection=ev.get("selection", "aic"),
+               force_form=(None if ev["bias_form"] == "auto" else ev["bias_form"]))
+    sel = C5._select(mu, "smoothed", cal, n_sites)
+    coef, form = sel["fit"]["coef"], sel["form"]
+    bias_info = dict(form=form, how=sel["how"], n=int(sel["fit"]["n"]),
+                     coef={nm: float(c) for nm, c in zip(C5._coef_names(form, H), coef)},
+                     aic_constant=C5._finite(sel["aic_constant"]),
+                     aic_seasonal=C5._finite(sel["aic_seasonal"]))
+    if "loso_cv_constant" in sel:
+        bias_info["loso_cv_constant"] = C5._finite(sel["loso_cv_constant"])
+        bias_info["loso_cv_seasonal"] = C5._finite(sel["loso_cv_seasonal"])
+
+    met = pd.DataFrame(C5._metrics(mu, "smoothed", coef, form, H, P))
+    loso = C5._loso_table(mu, "smoothed", coef, form, H, P) if n_sites >= 2 else pd.DataFrame()
+    loso_mse = C5._loso_cv_error(mu, "smoothed", form, H, P) if n_sites >= 2 else np.nan
+    loso_rmse = float(loso_mse ** 0.5) if np.isfinite(loso_mse) else None
+
+    (out / "reports" / "insitu_eval_bias.json").write_text(
+        _json(dict(bias_info, selection=cal["selection"], loso_rmse=loso_rmse)))
+    met.to_csv(out / "reports" / "insitu_eval_metrics.csv", index=False)
+    if not loso.empty:
+        loso.to_csv(out / "reports" / "insitu_eval_loso.csv", index=False)
+    elif n_sites < 2:
+        log.info("insitu_eval: only %d site(s); leave-one-site-out diagnostics skipped", n_sites)
+
+    if (met["site"] == "all").any():
+        a = met[met["site"] == "all"].iloc[0]
+        log.info("insitu_eval (%s bias, %s): RMSE %.3f -> %.3f K, bias %+.3f -> %+.3f K; "
+                 "LOSO RMSE %s", form, sel["how"], a["rmse_before"], a["rmse_after"],
+                 a["bias_before"], a["bias_after"],
+                 f"{loso_rmse:.3f} K" if loso_rmse is not None else "n/a (need >= 2 sites)")
+
+    if figures:
+        try:
+            dpi = int(pf["dpi"])
+            curve = C5._predict(coef, times, form, H, P)
+            C5._offset_figure(mu, "smoothed", bias_info, curve, times, H, P,
+                              out / "figures" / "insitu_eval_offset.png", dpi)
+            if not loso.empty:
+                C5._loso_figure(loso, bias_info, "smoothed",
+                                out / "figures" / "insitu_eval_loso.png", dpi)
+        except Exception as e:                        # a plotting bug must not lose the diagnostics
+            log.warning("insitu_eval figures failed: %s", e)
+
+    return dict(n_sites=n_sites, bias=bias_info, metrics=met, loso=loso, loso_rmse=loso_rmse)
 
 
 def _write_zarr(dest: Path, ok: pd.DataFrame, times, fitted: dict, series_df: pd.DataFrame,

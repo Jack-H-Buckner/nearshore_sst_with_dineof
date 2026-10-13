@@ -214,6 +214,27 @@ def test_point_filter_config_accepts_both_modes():
     assert set(rc["point_filter"]["groups"]) == {"a", "b"}
 
 
+def test_insitu_eval_config_accepts():
+    # validates even with no `groups` (the early return must not skip insitu_eval)
+    rc = _rc({"insitu_eval": {"enabled": True, "model": "random_walk",
+                              "sources": ["observed", "day_fill"], "bias_form": "seasonal",
+                              "bias_n_harmonics": 2, "selection": "loso_cv"}})
+    assert rc["point_filter"]["insitu_eval"]["enabled"] is True
+
+
+@pytest.mark.parametrize("ev, match", [
+    ({"enabled": True, "model": "random_walk", "sources": ["insitu", "observed"]}, "DINEOF-only"),
+    ({"enabled": True, "model": "random_walk", "sources": ["observed"],
+      "bias_form": "nope"}, "bias_form"),
+    ({"enabled": True, "model": "random_walk", "sources": ["observed"],
+      "selection": "nope"}, "selection"),
+    ({"enabled": True, "model": "random_walk", "sources": ["observed"], "bogus": 1}, "bogus"),
+])
+def test_insitu_eval_config_rejects(ev, match):
+    with pytest.raises(ValueError, match=match):
+        _rc({"insitu_eval": ev})
+
+
 def test_point_filter_config_accepts_insitu_bias():
     rc = _rc({"points": "p.csv", "groups": {
         "calib": {"model": "random_walk", "mode": "multiple",
