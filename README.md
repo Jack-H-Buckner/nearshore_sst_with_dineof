@@ -530,6 +530,12 @@ correction: (1) fit the smoother once on DINEOF sources only at each in-situ sit
 leave-one-site-out (LOSO)** — refit the bias on the other sites and evaluate at the held-out site.
 Sites come from `validation.insitu`; no points CSV is needed (LOSO needs ≥ 2 in-situ sites).
 
+In-situ source (modes 2 and 3): when `validation.insitu` points at a file, it is the raw
+observations and daily means are computed from them (gated by `validation.match.min_coverage`);
+when `validation.insitu` is null, the stage falls back to the in-situ data embedded in the cube
+(the `insitu_stations` attr and `insitu_sst` / `modis_insitu_sst` channels, one value per station
+pixel per day). It errors only if neither is available.
+
 ```yaml
 point_filter:
   insitu_eval:

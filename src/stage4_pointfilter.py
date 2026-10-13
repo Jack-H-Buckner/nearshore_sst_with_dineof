@@ -76,35 +76,66 @@ def extract_series(ds: xr.Dataset, placed: pd.DataFrame) -> list[dict]:
     return out
 
 
-def insitu_series(ds: xr.Dataset, ok: pd.DataFrame, rc: dict, days) -> np.ndarray:
-    """(T, n_sites) in-situ daily-mean series (degC) for each site: the nearest in-situ station
-    within point_filter.max_snap_m, from validation.insitu. NaN where no station is in range."""
-    insitu_path = rc["validation"]["insitu"]
-    if not insitu_path or not Path(insitu_path).exists():
-        raise SystemExit("a group uses the 'insitu' source but validation.insitu is not set to an "
-                         "existing netCDF / CSV")
-    vcfg = R.validate_vcfg(rc)
-    df = V.read_insitu(Path(insitu_path), vcfg)
-    water = np.asarray(ds[rc["region"]["watervar"]].values > 0.5)
-    stations = df.groupby("station_id", as_index=False).agg(
-        station_name=("station_name", "first"), lat=("lat", "median"), lon=("lon", "median"))
-    placed = V.place_stations(stations, ds, water, float(rc["point_filter"]["max_snap_m"]))
-    placed = placed[placed["row"] >= 0].reset_index(drop=True)
-    min_cov = float(vcfg["match"]["min_coverage"])
+def _load_insitu(ds: xr.Dataset, rc: dict, times) -> tuple[pd.DataFrame, dict]:
+    """(placed stations with row/col/x/y, {station_id: (T,) daily in-situ series, degC}).
+
+    Uses `validation.insitu` when it points at a file (daily means from the raw observations);
+    otherwise falls back to the cube's embedded in-situ channels (`insitu_stations` attr +
+    `insitu_sst` / `modis_insitu_sst`), which already hold one value per station pixel per day.
+    """
+    xs, ys = ds["x"].values, ds["y"].values
+    path = rc["validation"]["insitu"]
+    if path and Path(path).exists():
+        vcfg = R.validate_vcfg(rc)
+        df = V.read_insitu(Path(path), vcfg)
+        water = np.asarray(ds[rc["region"]["watervar"]].values > 0.5)
+        stations = df.groupby("station_id", as_index=False).agg(
+            station_name=("station_name", "first"), lat=("lat", "median"), lon=("lon", "median"))
+        placed = V.place_stations(stations, ds, water, float(rc["point_filter"]["max_snap_m"]))
+        placed = placed[placed["row"] >= 0].reset_index(drop=True)
+        days, min_cov = times.normalize(), float(vcfg["match"]["min_coverage"])
+        daily = {s["station_id"]: V.match_daily_mean(df[df["station_id"] == s["station_id"]],
+                                                     days, min_cov)[0]
+                 for _, s in placed.iterrows()}
+        return placed, daily
+    # Fallback: the in-situ channels carried in the cube itself.
+    if "insitu_stations" not in ds.attrs:
+        raise SystemExit("validation.insitu is null and the cube carries no in-situ data "
+                         "(no `insitu_stations` attr); set validation.insitu to a netCDF / CSV")
+    var = next((v for v in ("insitu_sst", "modis_insitu_sst") if v in ds), None)
+    if var is None:
+        raise SystemExit("validation.insitu is null and the cube has no insitu_sst / "
+                         "modis_insitu_sst channel to read")
+    placed = V.cube_stations(ds).reset_index(drop=True)
+    placed["x"] = xs[placed["col"].to_numpy()]
+    placed["y"] = ys[placed["row"].to_numpy()]
+    iy = xr.DataArray(placed["row"].to_numpy(), dims="station")
+    ix = xr.DataArray(placed["col"].to_numpy(), dims="station")
+    vals = ds[var].isel(y=iy, x=ix).values.astype(float)         # (T, n); the cube stores degC
+    daily = {sid: vals[:, k] for k, sid in enumerate(placed["station_id"])}
+    log.info("in-situ from cube channel %s: %d stations (validation.insitu is null)",
+             var, len(placed))
+    return placed, daily
+
+
+def insitu_series(ds: xr.Dataset, ok: pd.DataFrame, rc: dict, times) -> np.ndarray:
+    """(T, n_sites) in-situ daily series (degC) for each points-CSV site: the nearest in-situ
+    station within point_filter.max_snap_m. NaN where no station is in range."""
+    placed, daily = _load_insitu(ds, rc, times)
     max_snap = float(rc["point_filter"]["max_snap_m"])
-    I = np.full((len(days), len(ok)), np.nan)
+    I = np.full((len(times), len(ok)), np.nan)
+    if placed.empty:
+        return I
+    px, py = placed["x"].to_numpy(), placed["y"].to_numpy()
     for i in range(len(ok)):
-        if placed.empty:
-            break
-        d = np.hypot(placed["x"].to_numpy() - ok.loc[i, "x"], placed["y"].to_numpy() - ok.loc[i, "y"])
+        d = np.hypot(px - ok.loc[i, "x"], py - ok.loc[i, "y"])
         k = int(np.argmin(d))
         if d[k] > max_snap:
             continue
         sid = placed.loc[k, "station_id"]
-        dm, _ = V.match_daily_mean(df[df["station_id"] == sid], days, min_cov)
-        I[:, i] = dm
+        I[:, i] = daily[sid]
         log.info("  in-situ: site %s <- station %s (%.0f m, %d days)",
-                 ok.loc[i, "station_id"], sid, d[k], int(np.isfinite(dm).sum()))
+                 ok.loc[i, "station_id"], sid, d[k], int(np.isfinite(daily[sid]).sum()))
     return I
 
 
@@ -182,7 +213,7 @@ def _run_points(ds, rc: dict, pf: dict, out: Path, times, crs, cube: Path,
     series = extract_series(ds, ok)
     # In-situ channel: only read when some group actually uses it.
     if any("insitu" in _group_cfg(pf, g)["sources"] for g in groups):
-        I = insitu_series(ds, ok, rc, times.normalize())
+        I = insitu_series(ds, ok, rc, times)
         for i in range(len(ok)):
             series[i]["I"] = I[:, i]
 
@@ -242,16 +273,9 @@ def _run_insitu_eval(ds, rc: dict, pf: dict, ev: dict, out: Path, times, figures
     adjustment that did not see the site. Reuses stage 5's offset / metric / LOSO helpers.
     """
     import stage5_calibrate as C5                   # OLS offset + metrics + LOSO on a matchup frame
-    insitu_path = rc["validation"]["insitu"]
-    if not insitu_path or not Path(insitu_path).exists():
-        raise SystemExit("point_filter.insitu_eval needs validation.insitu (a netCDF / CSV)")
-    vcfg = R.validate_vcfg(rc)
-    df = V.read_insitu(Path(insitu_path), vcfg)
-    water = np.asarray(ds[rc["region"]["watervar"]].values > 0.5)
-    stations = df.groupby("station_id", as_index=False).agg(
-        station_name=("station_name", "first"), lat=("lat", "median"), lon=("lon", "median"))
-    ok = V.place_stations(stations, ds, water, float(pf["max_snap_m"]))
-    ok = ok[ok["row"] >= 0].reset_index(drop=True)
+    # Sites and daily in-situ come from validation.insitu, or the cube's own channels when it is null.
+    ok, daily = _load_insitu(ds, rc, times)
+    ok = ok.reset_index(drop=True)
     if ok.empty:
         raise SystemExit("insitu_eval: no in-situ stations placed on water")
 
@@ -264,14 +288,12 @@ def _run_insitu_eval(ds, rc: dict, pf: dict, ev: dict, out: Path, times, figures
              len(ok), gcfg["model"], gcfg["sources"])
     fit = SS.fit_group(times, series, gcfg)
 
-    # matchup frame: the smoothed point estimate vs the in-situ daily mean, per site x day.
+    # matchup frame: the smoothed point estimate vs the daily in-situ value, per site x day.
     days = times.normalize()
-    min_cov = float(vcfg["match"]["min_coverage"])
-    rows, smoothed = [], {}
+    rows = []
     for k in range(len(ok)):
         sm = fit["smoothed"][k][0]
-        smoothed[ok.loc[k, "station_id"]] = sm
-        dm, _ = V.match_daily_mean(df[df["station_id"] == ok.loc[k, "station_id"]], days, min_cov)
+        dm = daily[ok.loc[k, "station_id"]]
         for t in np.flatnonzero(np.isfinite(dm)):
             rows.append(dict(station_id=ok.loc[k, "station_id"], date=days[t].strftime("%Y-%m-%d"),
                              t=int(t), insitu=float(dm[t]), smoothed=float(sm[t])))

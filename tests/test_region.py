@@ -275,6 +275,41 @@ def test_stage4_insitu_eval(plain, tmp_path):
         assert (base / "figures" / f).exists(), f
 
 
+def test_load_insitu_cube_fallback():
+    """With validation.insitu null, in-situ sites/series come from the cube's embedded channels."""
+    import stage4_pointfilter as S4
+    T = 10
+    xs = np.arange(5) * 100.0; ys = np.arange(4) * 100.0
+    times = pd.date_range("2023-01-01", periods=T, freq="D")
+    insitu = np.full((T, 4, 5), np.nan)
+    insitu[:, 2, 3] = np.arange(T) + 10.0        # station A pixel, every day
+    insitu[0:5, 1, 1] = 20.0                      # station B pixel, first 5 days
+    ds = xr.Dataset({"insitu_sst": (("time", "y", "x"), insitu),
+                     "landcover_water": (("y", "x"), np.ones((4, 5), "uint8"))},
+                    coords={"time": times, "x": xs, "y": ys})
+    ds.attrs["insitu_stations"] = json.dumps([
+        {"id": "A", "row": 2, "col": 3, "index": 0, "lat": 0.0, "lon": 0.0},
+        {"id": "B", "row": 1, "col": 1, "index": 1, "lat": 0.0, "lon": 0.0}])
+    rc = {"validation": {"insitu": None}, "region": {"watervar": "landcover_water"},
+          "point_filter": {"max_snap_m": 300.0}}
+    placed, daily = S4._load_insitu(ds, rc, times)
+    assert set(placed["station_id"]) == {"A", "B"}
+    assert np.allclose(daily["A"], np.arange(T) + 10.0)
+    assert int(np.isfinite(daily["B"]).sum()) == 5
+
+
+def test_load_insitu_no_source_errors():
+    """validation.insitu null and no in-situ channels in the cube -> a clear error."""
+    import stage4_pointfilter as S4
+    ds = xr.Dataset({"landcover_water": (("y", "x"), np.ones((3, 3), "uint8"))},
+                    coords={"time": pd.date_range("2023-01-01", periods=3), "x": np.arange(3.0),
+                            "y": np.arange(3.0)})
+    rc = {"validation": {"insitu": None}, "region": {"watervar": "landcover_water"},
+          "point_filter": {"max_snap_m": 300.0}}
+    with pytest.raises(SystemExit, match="no in-situ data"):
+        S4._load_insitu(ds, rc, pd.to_datetime(ds["time"].values))
+
+
 # --------------------------------------------------------------------------- CLI
 
 def test_run_region_all(tmp_path, plain):
