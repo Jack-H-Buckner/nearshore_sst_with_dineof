@@ -31,7 +31,8 @@ import region as R
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("stage", choices=("offsets", "dineof", "validate", "all"))
+    p.add_argument("stage", choices=("offsets", "dineof", "validate", "pointfilter", "calibrate",
+                                     "all"))
     p.add_argument("--config", type=Path, required=True, help="region YAML")
     p.add_argument("--tag", default=None, help="suffix the region's output directory")
     p.add_argument("--masks", type=Path, default=None,
@@ -47,7 +48,15 @@ def main(argv=None) -> None:
     if not Path(rc["region"]["source"]).exists():
         raise SystemExit(f"region.source: no cube at {rc['region']['source']}")
     figs = not args.no_figures
-    stages = ("offsets", "dineof", "validate") if args.stage == "all" else (args.stage,)
+    if args.stage == "all":
+        stages = ["offsets", "dineof", "validate"]
+        if rc["point_filter"].get("points"):
+            stages.append("pointfilter")
+        if rc["calibration"].get("enabled"):
+            stages.append("calibrate")
+        stages = tuple(stages)
+    else:
+        stages = (args.stage,)
     for st in stages:
         if st == "offsets":
             import stage1_offsets
@@ -55,9 +64,15 @@ def main(argv=None) -> None:
         elif st == "dineof":
             import stage2_dineof
             stage2_dineof.run(rc, tag=args.tag, figures=figs)
-        else:
+        elif st == "validate":
             import stage3_validate
             stage3_validate.run(rc, tag=args.tag, figures=figs)
+        elif st == "pointfilter":
+            import stage4_pointfilter
+            stage4_pointfilter.run(rc, tag=args.tag, figures=figs)
+        else:
+            import stage5_calibrate
+            stage5_calibrate.run(rc, tag=args.tag, figures=figs)
 
 
 if __name__ == "__main__":

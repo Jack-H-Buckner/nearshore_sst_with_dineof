@@ -157,7 +157,15 @@ def cmd_stage(args) -> int:
     if not Path(rc["region"]["source"]).exists():
         raise SystemExit(f"region.source: no cube at {rc['region']['source']}")
     figs = not args.no_figures
-    stages = ("offsets", "dineof", "validate") if args.command == "all" else (args.command,)
+    if args.command == "all":
+        stages = ["offsets", "dineof", "validate"]
+        if rc["point_filter"].get("points"):       # only when a points CSV is configured
+            stages.append("pointfilter")
+        if rc["calibration"].get("enabled"):        # only when calibration is turned on
+            stages.append("calibrate")
+        stages = tuple(stages)
+    else:
+        stages = (args.command,)
     for st in stages:
         if st == "offsets":
             import stage1_offsets
@@ -166,9 +174,15 @@ def cmd_stage(args) -> int:
         elif st == "dineof":
             import stage2_dineof
             stage2_dineof.run(rc, tag=args.tag, figures=figs)
-        else:
+        elif st == "validate":
             import stage3_validate
             stage3_validate.run(rc, tag=args.tag, figures=figs)
+        elif st == "pointfilter":
+            import stage4_pointfilter
+            stage4_pointfilter.run(rc, tag=args.tag, figures=figs)
+        else:
+            import stage5_calibrate
+            stage5_calibrate.run(rc, tag=args.tag, figures=figs)
     return 0
 
 
@@ -213,6 +227,26 @@ def cmd_status(args) -> int:
                   f"MSE {r.get('mse', float('nan')):.3f}  bias {r['bias']:+.3f}")
     else:
         print("  stage 3  not run")
+    params = d["pointfilter"] / "reports" / "point_params.csv"
+    if params.exists():
+        import pandas as pd
+        pr = pd.read_csv(params)
+        groups = sorted(pr["group"].unique())
+        print(f"  stage 4  done  ({len(groups)} group(s): {', '.join(map(str, groups))})")
+        for g in groups:
+            aic = pr[(pr["group"] == g) & (pr["name"] == "aic")]["value"]
+            print(f"           {g}: AIC {aic.iloc[0]:.1f}" if len(aic) else f"           {g}")
+    else:
+        print("  stage 4  not run")
+    offjson = d["calibration"] / "reports" / "offsets.json"
+    if offjson.exists():
+        o = json.loads(offjson.read_text())
+        print("  stage 5  done")
+        for p, s in o.items():
+            print(f"           {p:17s} {s['form']:8s} ({s['how']}) n={s['n']:5d}  "
+                  f"mean {s['coef'].get('mean', float('nan')):+.3f} K")
+    else:
+        print("  stage 5  not run")
     return 0
 
 
@@ -273,7 +307,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-figures", action="store_true")
     s = with_config("validate", "stage 3: validation against in situ", cmd_stage)
     s.add_argument("--no-figures", action="store_true")
-    s = with_config("all", "stages 1-3 in order", cmd_stage)
+    s = with_config("pointfilter", "stage 4: point-level state-space (Kalman) smoother", cmd_stage)
+    s.add_argument("--no-figures", action="store_true")
+    s = with_config("calibrate", "stage 5: calibrate DINEOF fields against in situ", cmd_stage)
+    s.add_argument("--no-figures", action="store_true")
+    s = with_config("all", "stages 1-3 (stage 4 when point_filter.points is set, stage 5 when "
+                    "calibration.enabled)", cmd_stage)
     s.add_argument("--max-iter", type=int, default=None, help="override loop.max_iter")
     s.add_argument("--no-figures", action="store_true")
     with_config("status", "show what each stage has produced", cmd_status)

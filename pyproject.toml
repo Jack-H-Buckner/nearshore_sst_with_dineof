@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 # Install with `pip install -e .` (or inside a compatible conda environment).
 dependencies = [
     "numpy", "scipy", "pandas", "xarray", "zarr", "numcodecs", "matplotlib",
-    "pyproj", "pyyaml", "pydantic>=2.7",
+    "pyproj", "pyyaml", "pydantic>=2.7", "statsmodels>=0.14",
 ]
 
 [project.scripts]

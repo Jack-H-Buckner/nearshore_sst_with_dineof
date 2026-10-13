@@ -224,3 +224,51 @@ validation:
     max_dt_min: 60.0          # overpass match tolerance
     min_coverage: 0.75        # daily mean needs this share of the day's hours
     max_snap_m: 300.0         # land-pixel stations snap to water within this
+
+# ------------------------------------------------------------------ stage 4: point filter
+# Optional. Point-level state-space (Kalman) smoothing of the gap-filled fields at named sites.
+# Enabled only when `points` is set. Run with `... pointfilter`; included in `... all` when set.
+# point_filter:
+#   points: configs/points.admiralty_inlet.csv   # columns: site_id, lat, lon, group
+#   period_days: 365.25
+#   max_snap_m: 300.0
+#   dpi: 130
+#   groups:
+#     moorings:                      # one site group -> one jointly-fit model
+#       model: ar1_harmonic          # random_walk | ar1 | ar1_harmonic | harmonic_trend
+#       n_harmonics: 2               # required (>=1) for the harmonic models
+#       mode: hierarchy              # hierarchy (one obs/day, by precedence) | multiple (fuse)
+#       sources: [observed, point_fill, day_fill]   # observation types, in precedence order
+#       # each type's observation error is estimated by MLE; `share` pools parameters across the
+#       # group's sites (process_var, phi, mu, beta, obs_var.<type>):
+#       share: [process_var, phi, obs_var.observed, obs_var.point_fill, obs_var.day_fill]
+#     smooth_only:                   # use the smooth field even where the pixel was observed;
+#       model: random_walk           # its error still varies by the day's context
+#       mode: hierarchy
+#       sources: [smooth_observed, smooth_point_fill, smooth_day_fill, smooth_climatology]
+#       share: []                    # fit each site independently
+#     calibrated:                    # fuse in-situ (from validation.insitu) with DINEOF and fit a
+#       model: random_walk           # DINEOF measurement bias (constant + seasonal). in-situ is the
+#       mode: multiple               # unbiased anchor; `multiple` feeds both on paired days.
+#       sources: [insitu, observed, point_fill, day_fill]
+#       dineof_bias: seasonal        # none | constant | seasonal  (c0 + harmonic bias on DINEOF)
+#       bias_n_harmonics: 1          # required (>=1) for a seasonal bias
+#       share: [process_var, obs_var.insitu, obs_var.observed, obs_var.point_fill,
+#               obs_var.day_fill, bias_const, bias_seasonal]
+
+# ------------------------------------------------------------------ stage 5: calibration
+# Optional. Per-product additive offset (insitu - product) fit on the daily-mean matchups and
+# applied to produce calibrated fields (<product>_cal). Admiralty Inlet currently has a single
+# in-situ site (Port Townsend), so `selection: loso_cv` falls back to aic and the leave-one-site-
+# out diagnostics are skipped until a second site is configured. Run with `... calibrate`;
+# included in `... all` only when `enabled: true`.
+# calibration:
+#   enabled: true
+#   products: [sst_filled, sst_filled_point, sst_filled_day, sst_smooth]
+#   match: daily_mean          # daily_mean | overpass
+#   selection: aic             # aic | loso_cv (loso_cv needs >= 2 sites)
+#   n_harmonics: 2
+#   period_days: 365.25
+#   min_gain: 0.0
+#   force_form: null           # null | constant | seasonal
+#   dpi: 130

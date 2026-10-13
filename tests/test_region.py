@@ -16,6 +16,7 @@ import region as R
 import run_region
 import stage1_offsets as S1
 import stage2_dineof as S2
+import stage4_pointfilter as S4
 import stage3_validate as S3
 import synthetic_cube as SC
 
@@ -167,6 +168,70 @@ def test_stage3_requires_insitu(tmp_path, plain):
     rc["validation"]["insitu"] = None
     with pytest.raises(SystemExit, match="insitu"):
         S3.run(rc, figures=False)
+
+
+# --------------------------------------------------------------------------- stage 4
+
+def _points_csv(path):
+    tr = Transformer.from_crs("EPSG:32610", "EPSG:4326", always_xy=True)
+    rows = []
+    for sid, (row, col), grp in [("A", (20, 30), "g1"), ("B", (22, 28), "g1")]:
+        x = SC.X0 + SC.DX * (col + 0.5)
+        y = SC.Y0 - SC.DX * (row + 0.5)
+        lon, lat = tr.transform(x, y)
+        rows.append(dict(site_id=sid, lat=lat, lon=lon, group=grp))
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+def test_stage4_pointfilter(plain, tmp_path):
+    csv = _points_csv(tmp_path / "points.csv")
+    rc = dict(plain["rc"])
+    rc["point_filter"] = {"points": str(csv), "period_days": 365.25, "max_snap_m": 500.0,
+                          "dpi": 60, "groups": {"g1": {
+                              "model": "random_walk", "mode": "hierarchy",
+                              "sources": ["observed", "day_fill"],
+                              "share": ["process_var", "obs_var.observed"]}}}
+    out = S4.run(rc, figures=True)
+    d = R.stage_dirs(rc)["pointfilter"]
+    assert (d / "reports" / "point_series.csv").exists()
+    assert (d / "reports" / "point_params.csv").exists()
+    cube = d / "synthetic_points.zarr"
+    assert cube.exists()
+    with xr.open_zarr(cube) as ps:
+        assert ps.sizes["site"] == 2 and ps.sizes["time"] == len(plain["truth"]["times"])
+        assert np.isfinite(ps["smoothed_mean"].values).mean() > 0.9
+        assert (ps["smoothed_sd"].values >= 0).all()
+    series = out["series"]
+    assert set(series["site"]) == {"A", "B"}
+    # a shared group fits one process_var and one obs_var.observed for both sites
+    params = pd.read_csv(d / "reports" / "point_params.csv")
+    assert (params["name"] == "process_var").any()
+    for f in ("A.png", "B.png"):
+        assert (d / "figures" / f).exists(), f
+
+
+def test_stage4_insitu_bias(plain, tmp_path):
+    """A group that fuses in-situ with DINEOF and fits a constant DINEOF bias runs end to end."""
+    insitu = _insitu_csv(plain, tmp_path / "insitu.csv")           # station S1 at pixel (20, 30)
+    tr = Transformer.from_crs("EPSG:32610", "EPSG:4326", always_xy=True)
+    x = SC.X0 + SC.DX * (30 + 0.5); y = SC.Y0 - SC.DX * (20 + 0.5)
+    lon, lat = tr.transform(x, y)
+    csv = tmp_path / "points_bias.csv"
+    pd.DataFrame([dict(site_id="A", lat=lat, lon=lon, group="calib")]).to_csv(csv, index=False)
+    rc = dict(plain["rc"])
+    rc["validation"] = {**rc["validation"], "insitu": str(insitu)}
+    rc["point_filter"] = {"points": str(csv), "period_days": 365.25, "max_snap_m": 500.0,
+                          "dpi": 60, "groups": {"calib": {
+                              "model": "random_walk", "mode": "multiple",
+                              "sources": ["insitu", "observed", "day_fill"],
+                              "dineof_bias": "constant", "share": ["bias_const"]}}}
+    out = S4.run(rc, figures=False)
+    params = pd.read_csv(R.stage_dirs(rc)["pointfilter"] / "reports" / "point_params.csv")
+    assert (params["name"] == "bias_const").any()
+    with xr.open_zarr(R.stage_dirs(rc)["pointfilter"] / "synthetic_points.zarr") as ps:
+        assert "insitu_obs" in ps and "dineof_bias" in ps
+        assert np.isfinite(ps["insitu_obs"].values).any()      # in-situ was matched and fed
 
 
 # --------------------------------------------------------------------------- CLI

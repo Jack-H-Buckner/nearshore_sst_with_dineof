@@ -144,3 +144,46 @@ validation:
   # sensitive the metrics are to single-pixel sampling. Pixel counts (odd perfect squares); 1 = the
   # single station pixel. e.g. [1, 9, 25, 49]. Land/invalid box pixels are dropped before averaging.
   match: {max_dt_min: 60.0, min_coverage: 0.75, max_snap_m: 300.0, box_sizes: [1]}
+
+# ------------------------------------------------------------------ stage 4: point filter
+# Optional point-level state-space (Kalman) smoothing at named sites. Enabled only when `points`
+# is set (a CSV of site_id, lat, lon, group). Models: random_walk | ar1 | ar1_harmonic |
+# harmonic_trend. Observation types -- observed, point_fill, day_fill, smooth_observed,
+# smooth_point_fill, smooth_day_fill, smooth_climatology -- each get an MLE-estimated error that
+# `share` can pool across a group's sites. `mode: hierarchy` uses one obs/day by precedence;
+# `mode: multiple` feeds all available types that day. Add the `insitu` source (from
+# validation.insitu, nearest station within max_snap_m) to fuse in-situ, and `dineof_bias`
+# (constant|seasonal, needs insitu + mode: multiple) to estimate a DINEOF measurement bias.
+# point_filter:
+#   points: configs/points.<aoi>.csv
+#   groups:
+#     sites:
+#       model: ar1
+#       mode: hierarchy
+#       sources: [observed, point_fill, day_fill]
+#       share: [process_var, obs_var.observed]
+#     calibrated:
+#       model: random_walk
+#       mode: multiple
+#       sources: [insitu, observed, day_fill]
+#       dineof_bias: seasonal
+#       bias_n_harmonics: 1
+#       share: [process_var, obs_var.insitu, bias_const, bias_seasonal]
+
+# ------------------------------------------------------------------ stage 5: calibration
+# Optional. Fit an additive offset (insitu - product) per DINEOF product and apply it to produce
+# calibrated fields (<product>_cal). The form (constant vs seasonal day-of-year harmonics) is
+# chosen per product by `selection`: `aic` (keep seasonal only when it beats constant by
+# `min_gain` AIC units) or `loso_cv` (lower leave-one-site-out error, weighted by obs per held-out
+# site; needs >= 2 sites, else falls back to aic). `force_form` skips the selection. Run with
+# `... calibrate`; included in `... all` only when `enabled: true`. Needs validation.insitu.
+# calibration:
+#   enabled: true
+#   products: [sst_filled, sst_filled_point, sst_filled_day, sst_smooth]
+#   match: daily_mean          # daily_mean | overpass
+#   selection: aic             # aic | loso_cv
+#   n_harmonics: 2
+#   period_days: 365.25
+#   min_gain: 0.0
+#   force_form: null           # null | constant | seasonal
+#   dpi: 130
